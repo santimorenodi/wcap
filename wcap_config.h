@@ -56,6 +56,8 @@ typedef struct
 	DWORD ShortcutMonitor;
 	DWORD ShortcutWindow;
 	DWORD ShortcutRegion;
+	// countdown in seconds before recording starts (0 = disabled), only in .ini file
+	DWORD Countdown;
 }
 Config;
 
@@ -883,6 +885,8 @@ void Config_Defaults(Config* C)
 		.ShortcutMonitor = HOT_KEY(VK_SNAPSHOT, MOD_CONTROL),
 		.ShortcutWindow = HOT_KEY(VK_SNAPSHOT, MOD_CONTROL | MOD_WIN),
 		.ShortcutRegion = HOT_KEY(VK_SNAPSHOT, MOD_CONTROL | MOD_SHIFT),
+		// countdown
+		.Countdown = 3,
 	};
 
 	LPWSTR VideoFolder;
@@ -994,6 +998,8 @@ void Config_Load(Config* C, LPCWSTR FileName)
 	Config__GetInt(FileName, L"ShortcutMonitor", &C->ShortcutMonitor, NULL);
 	Config__GetInt(FileName, L"ShortcutWindow",  &C->ShortcutWindow,  NULL);
 	Config__GetInt(FileName, L"ShortcutRect",    &C->ShortcutRegion,  NULL);
+	// countdown
+	Config__GetInt(FileName, L"Countdown", &C->Countdown, NULL);
 
 	Config__ValidateVideoProfile(C);
 }
@@ -1043,6 +1049,8 @@ void Config_Save(Config* C, LPCWSTR FileName)
 	Config__WriteInt(FileName, L"ShortcutMonitor", C->ShortcutMonitor);
 	Config__WriteInt(FileName, L"ShortcutWindow",  C->ShortcutWindow);
 	Config__WriteInt(FileName, L"ShortcutRect",    C->ShortcutRegion);
+	// countdown
+	Config__WriteInt(FileName, L"Countdown", C->Countdown);
 }
 
 BOOL Config_ShowDialog(Config* C)

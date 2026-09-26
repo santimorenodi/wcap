@@ -53,6 +53,15 @@ __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 #define WCAP_VIDEO_UPDATE_TIMER     2
 #define WCAP_VIDEO_UPDATE_INTERVAL  100 // msec
 
+#define WCAP_COUNTDOWN_TIMER        3
+#define WCAP_COUNTDOWN_INTERVAL     1000 // msec
+
+#define WCAP_CLI_DURATION_TIMER     4
+
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE      0x11
+#endif
+
 #define CMD_WCAP     1
 #define CMD_QUIT     2
 #define CMD_SETTINGS 3
@@ -76,6 +85,9 @@ __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 #define WCAP_UI_FONT_SIZE 16
 
 #define WCAP_RECT_BORDER 2
+
+#define WCAP_COUNTDOWN_SIZE      220
+#define WCAP_COUNTDOWN_FONT_SIZE 160
 
 // constants
 static WCHAR gConfigPath[MAX_PATH];
@@ -115,6 +127,14 @@ static int gRectResize;
 static int gRectSetSize[2];
 static BOOL gRectSetSizeClick;
 
+// countdown before recording starts
+static HWND gCountdownWindow;
+static HFONT gFontCountdown;
+static DWORD gCountdownValue; // 0 when countdown is not active
+static WPARAM gCountdownAction; // HOT_RECORD_xyz
+static HWND gCountdownTargetWindow;
+static HMONITOR gCountdownTargetMonitor;
+
 // globals
 static HWND gWindow;
 static Config gConfig;
@@ -122,8 +142,19 @@ static AudioCapture gAudio;
 static ScreenCapture gCapture;
 static Encoder gEncoder;
 
+#if defined(WCAP_CLI)
+static WCHAR gCliOutputPath[MAX_PATH];
+static int gCliExitCode = 1;
+#endif
+
 static void ShowNotification(LPCWSTR Message, LPCWSTR Title, DWORD Flags)
 {
+#if defined(WCAP_CLI)
+	WCHAR Text[512];
+	StrFormat(Text, L"%ls: %ls\n", Title ? Title : WCAP_TITLE, Message);
+	WriteText(STD_ERROR_HANDLE, Text);
+	return;
+#endif
 	NOTIFYICONDATAW Data =
 	{
 		.cbSize = sizeof(Data),
@@ -139,6 +170,9 @@ static void ShowNotification(LPCWSTR Message, LPCWSTR Title, DWORD Flags)
 
 static void UpdateTrayTitle(LPCWSTR Title)
 {
+#if defined(WCAP_CLI)
+	return;
+#endif
 	NOTIFYICONDATAW Data =
 	{
 		.cbSize = sizeof(Data),
@@ -151,6 +185,9 @@ static void UpdateTrayTitle(LPCWSTR Title)
 
 static void UpdateTrayIcon(HICON Icon)
 {
+#if defined(WCAP_CLI)
+	return;
+#endif
 	NOTIFYICONDATAW Data =
 	{
 		.cbSize = sizeof(Data),
@@ -163,6 +200,9 @@ static void UpdateTrayIcon(HICON Icon)
 
 static void AddTrayIcon(HWND Window)
 {
+#if defined(WCAP_CLI)
+	return;
+#endif
 	NOTIFYICONDATAW Data =
 	{
 		.cbSize = sizeof(Data),
@@ -177,6 +217,9 @@ static void AddTrayIcon(HWND Window)
 
 static void RemoveTrayIcon(HWND Window)
 {
+#if defined(WCAP_CLI)
+	return;
+#endif
 	NOTIFYICONDATAW Data =
 	{
 		.cbSize = sizeof(Data),
@@ -215,6 +258,13 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 
 	StrCpyW(gRecordingPath, gConfig.OutputFolder);
 	PathAppendW(gRecordingPath, Filename);
+
+#if defined(WCAP_CLI)
+	if (gCliOutputPath[0])
+	{
+		StrCpyW(gRecordingPath, gCliOutputPath);
+	}
+#endif
 
 	DWM_TIMING_INFO Info = { .cbSize = sizeof(Info) };
 	HR(DwmGetCompositionTimingInfo(NULL, &Info));
@@ -356,6 +406,24 @@ static void StopRecording(void)
 
 	UpdateTrayIcon(gIcon1);
 	UpdateTrayTitle(WCAP_TITLE);
+
+#if defined(WCAP_CLI)
+	KillTimer(gWindow, WCAP_CLI_DURATION_TIMER);
+
+	WIN32_FILE_ATTRIBUTE_DATA Attributes;
+	UINT64 FileSize = 0;
+	if (GetFileAttributesExW(gRecordingPath, GetFileExInfoStandard, &Attributes))
+	{
+		FileSize = ((UINT64)Attributes.nFileSizeHigh << 32) | Attributes.nFileSizeLow;
+	}
+
+	WCHAR Text[1024];
+	StrFormat(Text, L"saved: %ls\nsize: %I64u bytes\ndropped_frames: %u\n", gRecordingPath, FileSize, gRecordingDroppedFrames);
+	WriteText(STD_OUTPUT_HANDLE, Text);
+
+	gCliExitCode = 0;
+	PostQuitMessage(0);
+#endif
 }
 
 static ID3D11Device* CreateDevice(void)
@@ -414,13 +482,13 @@ static ID3D11Device* CreateDevice(void)
 	return Device;
 }
 
-static void CaptureWindow(void)
+// returns top-level window that can be captured, or NULL
+static HWND GetCaptureWindow(HWND Window)
 {
-	HWND Window = GetForegroundWindow();
 	if (Window == NULL)
 	{
 		ShowNotification(L"No window is selected!", L"Cannot Start Recording", NIIF_WARNING);
-		return;
+		return NULL;
 	}
 
 	// figure out who is owner of child window if somehow child window is selected (happens for fancy winamp skins)
@@ -438,13 +506,24 @@ static void CaptureWindow(void)
 	if (Affinity != WDA_NONE)
 	{
 		ShowNotification(L"Window is excluded from capture!", L"Cannot Start Recording", NIIF_WARNING);
-		return;
+		return NULL;
 	}
 
 	LONG ExStyle = GetWindowLongW(Window, GWL_EXSTYLE);
 	if (ExStyle & WS_EX_TOOLWINDOW)
 	{
 		ShowNotification(L"Cannot capture toolbar window!", L"Cannot Start Recording", NIIF_WARNING);
+		return NULL;
+	}
+
+	return Window;
+}
+
+static void CaptureWindow(HWND Window)
+{
+	if (!IsWindow(Window))
+	{
+		ShowNotification(L"Window does not exist anymore!", L"Cannot Start Recording", NIIF_WARNING);
 		return;
 	}
 
@@ -464,7 +543,8 @@ static void CaptureWindow(void)
 	StartRecording(Device, Window);
 }
 
-static void CaptureMonitor(void)
+// returns monitor where mouse cursor is, or NULL
+static HMONITOR GetCaptureMonitor(void)
 {
 	POINT Mouse;
 	GetCursorPos(&Mouse);
@@ -473,17 +553,22 @@ static void CaptureMonitor(void)
 	if (Monitor == NULL)
 	{
 		ShowNotification(L"Unknown monitor!", L"Cannot Start Recording", NIIF_WARNING);
-		return;
 	}
+	return Monitor;
+}
 
+// Rect is optional, in monitor relative coordinates
+static void CaptureMonitor(HMONITOR Monitor, const RECT* Rect)
+{
 	ID3D11Device* Device = CreateDevice();
 	if (!Device)
 	{
 		return;
 	}
 
-	if (!ScreenCapture_CreateForMonitor(&gCapture, Device, Monitor, NULL))
+	if (!ScreenCapture_CreateForMonitor(&gCapture, Device, Monitor, Rect))
 	{
+		ID3D11Device_Release(Device);
 		ShowNotification(L"Cannot record selected monitor!", L"Error", NIIF_WARNING);
 		return;
 	}
@@ -645,6 +730,105 @@ static void CaptureRegion(void)
 	}
 }
 
+static void CountdownStop(void)
+{
+	KillTimer(gWindow, WCAP_COUNTDOWN_TIMER);
+	if (gCountdownWindow)
+	{
+		ShowWindow(gCountdownWindow, SW_HIDE);
+	}
+	gCountdownValue = 0;
+}
+
+static void CountdownFinish(void)
+{
+	CountdownStop();
+
+	// make sure compositor has removed countdown window from screen before capture starts
+	DwmFlush();
+
+	gRecordingStarted = TRUE;
+	if (gCountdownAction == HOT_RECORD_WINDOW)
+	{
+		CaptureWindow(gCountdownTargetWindow);
+	}
+	else if (gCountdownAction == HOT_RECORD_MONITOR)
+	{
+		CaptureMonitor(gCountdownTargetMonitor, NULL);
+	}
+	else if (gCountdownAction == HOT_RECORD_REGION)
+	{
+		CaptureRegion();
+	}
+	gRecordingStarted = FALSE;
+}
+
+// shows countdown centered on Area (screen coordinates), recording starts when it reaches zero
+static void CountdownStart(WPARAM Action, const RECT* Area)
+{
+	gCountdownAction = Action;
+
+	if (gConfig.Countdown == 0 || gCountdownWindow == NULL)
+	{
+		CountdownFinish();
+		return;
+	}
+
+	gCountdownValue = gConfig.Countdown;
+
+	int X = (Area->left + Area->right - WCAP_COUNTDOWN_SIZE) / 2;
+	int Y = (Area->top + Area->bottom - WCAP_COUNTDOWN_SIZE) / 2;
+	SetWindowPos(gCountdownWindow, HWND_TOPMOST, X, Y, WCAP_COUNTDOWN_SIZE, WCAP_COUNTDOWN_SIZE, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+	InvalidateRect(gCountdownWindow, NULL, FALSE);
+
+	SetTimer(gWindow, WCAP_COUNTDOWN_TIMER, WCAP_COUNTDOWN_INTERVAL, NULL);
+}
+
+static LRESULT CALLBACK CountdownWindowProc(HWND Window, UINT Message, WPARAM WParam, LPARAM LParam)
+{
+	if (Message == WM_NCHITTEST)
+	{
+		return HTTRANSPARENT;
+	}
+	else if (Message == WM_ERASEBKGND)
+	{
+		return 1;
+	}
+	else if (Message == WM_PAINT)
+	{
+		PAINTSTRUCT Paint;
+		HDC PaintContext = BeginPaint(Window, &Paint);
+
+		HDC Context;
+		HPAINTBUFFER BufferedPaint = BeginBufferedPaint(PaintContext, &Paint.rcPaint, BPBF_COMPATIBLEBITMAP, NULL, &Context);
+		if (BufferedPaint)
+		{
+			RECT Rect;
+			GetClientRect(Window, &Rect);
+
+			HBRUSH Brush = CreateSolidBrush(RGB(24, 24, 24));
+			Assert(Brush);
+			FillRect(Context, &Rect, Brush);
+			DeleteObject(Brush);
+
+			WCHAR Text[16];
+			int TextLength = StrFormat(Text, L"%u", gCountdownValue);
+
+			SelectObject(Context, gFontCountdown);
+			SetTextColor(Context, RGB(255, 255, 255));
+			SetBkMode(Context, TRANSPARENT);
+			DrawTextW(Context, Text, TextLength, &Rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+			EndBufferedPaint(BufferedPaint, TRUE);
+		}
+
+		EndPaint(Window, &Paint);
+		return 0;
+	}
+
+	return DefWindowProcW(Window, Message, WParam, LParam);
+}
+
 static int GetPointResize(int X, int Y)
 {
 	int BorderX = GetSystemMetrics(SM_CXSIZEFRAME);
@@ -733,6 +917,7 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	}
 	else if (Message == WM_DESTROY)
 	{
+		CountdownStop();
 		if (gRecording)
 		{
 			StopRecording();
@@ -773,7 +958,20 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 			{
 				if (gRectSelected)
 				{
-					CaptureRegion();
+					MONITORINFO Info = { .cbSize = sizeof(Info) };
+					GetMonitorInfoW(gRectMonitor, &Info);
+
+					RECT Area =
+					{
+						.left   = Info.rcMonitor.left + min(gRectSelection[0].x, gRectSelection[1].x),
+						.top    = Info.rcMonitor.top  + min(gRectSelection[0].y, gRectSelection[1].y),
+						.right  = Info.rcMonitor.left + max(gRectSelection[0].x, gRectSelection[1].x),
+						.bottom = Info.rcMonitor.top  + max(gRectSelection[0].y, gRectSelection[1].y),
+					};
+
+					// hide selection overlay, selected rectangle stays in gRectSelection for CaptureRegion
+					CaptureRegionDone();
+					CountdownStart(HOT_RECORD_REGION, &Area);
 				}
 				return 0;
 			}
@@ -942,6 +1140,29 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	}
 	else if (Message == WM_TIMER)
 	{
+		if (WParam == WCAP_COUNTDOWN_TIMER)
+		{
+			if (gCountdownValue > 1)
+			{
+				gCountdownValue--;
+				InvalidateRect(gCountdownWindow, NULL, FALSE);
+			}
+			else
+			{
+				CountdownFinish();
+			}
+			return 0;
+		}
+#if defined(WCAP_CLI)
+		if (WParam == WCAP_CLI_DURATION_TIMER)
+		{
+			if (gRecording)
+			{
+				StopRecording();
+			}
+			return 0;
+		}
+#endif
 		if (gRecording)
 		{
 			if (WParam == WCAP_AUDIO_CAPTURE_TIMER)
@@ -1044,21 +1265,36 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 		{
 			StopRecording();
 		}
+		else if (gCountdownValue)
+		{
+			// any shortcut during countdown cancels it
+			CountdownStop();
+		}
 		else if (!gRecordingStarted)
 		{
 			if (gRectContext == NULL)
 			{
 				if (WParam == HOT_RECORD_WINDOW)
 				{
-					gRecordingStarted = TRUE;
-					CaptureWindow();
-					gRecordingStarted = FALSE;
+					HWND Target = GetCaptureWindow(GetForegroundWindow());
+					if (Target)
+					{
+						RECT Area;
+						GetWindowRect(Target, &Area);
+						gCountdownTargetWindow = Target;
+						CountdownStart(HOT_RECORD_WINDOW, &Area);
+					}
 				}
 				else if (WParam == HOT_RECORD_MONITOR)
 				{
-					gRecordingStarted = TRUE;
-					CaptureMonitor();
-					gRecordingStarted = FALSE;
+					HMONITOR Target = GetCaptureMonitor();
+					if (Target)
+					{
+						MONITORINFO Info = { .cbSize = sizeof(Info) };
+						GetMonitorInfoW(Target, &Info);
+						gCountdownTargetMonitor = Target;
+						CountdownStart(HOT_RECORD_MONITOR, &Info.rcMonitor);
+					}
 				}
 				else if (WParam == HOT_RECORD_REGION)
 				{
@@ -1372,6 +1608,8 @@ static bool OnCaptureFrame(ScreenCapture* Capture, ScreenCaptureFrame* Frame)
 	return true;
 }
 
+#if !defined(WCAP_CLI)
+
 #ifndef NDEBUG
 int WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR cmdline, int cmdshow)
 #else
@@ -1430,6 +1668,11 @@ void WinMainCRTStartup()
 		CLEARTYPE_QUALITY, DEFAULT_PITCH, WCAP_UI_FONT);
 	Assert(gFontBold);
 
+	gFontCountdown = CreateFontW(-WCAP_COUNTDOWN_FONT_SIZE, 0, 0, 0, FW_BOLD,
+		FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+		CLEARTYPE_QUALITY, DEFAULT_PITCH, WCAP_UI_FONT);
+	Assert(gFontCountdown);
+
 	gIcon1 = LoadIconW(WindowClass.hInstance, MAKEINTRESOURCEW(1));
 	gIcon2 = LoadIconW(WindowClass.hInstance, MAKEINTRESOURCEW(2));
 	Assert(gIcon1 && gIcon2);
@@ -1448,6 +1691,30 @@ void WinMainCRTStartup()
 	{
 		ExitProcess(0);
 	}
+
+	WNDCLASSEXW CountdownClass =
+	{
+		.cbSize = sizeof(CountdownClass),
+		.lpfnWndProc = CountdownWindowProc,
+		.hInstance = WindowClass.hInstance,
+		.lpszClassName = L"wcap_countdown_class",
+	};
+	if (RegisterClassExW(&CountdownClass))
+	{
+		gCountdownWindow = CreateWindowExW(
+			WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+			CountdownClass.lpszClassName, WCAP_TITLE, WS_POPUP,
+			0, 0, WCAP_COUNTDOWN_SIZE, WCAP_COUNTDOWN_SIZE,
+			NULL, NULL, WindowClass.hInstance, NULL);
+		if (gCountdownWindow)
+		{
+			SetLayeredWindowAttributes(gCountdownWindow, 0, 224, LWA_ALPHA);
+			SetWindowRgn(gCountdownWindow, CreateRoundRectRgn(0, 0, WCAP_COUNTDOWN_SIZE + 1, WCAP_COUNTDOWN_SIZE + 1, 48, 48), FALSE);
+			// never let countdown itself end up in recording
+			SetWindowDisplayAffinity(gCountdownWindow, WDA_EXCLUDEFROMCAPTURE);
+		}
+	}
+
 	if (!EnableHotKeys())
 	{
 		MessageBoxW(NULL,
@@ -1469,3 +1736,539 @@ void WinMainCRTStartup()
 		DispatchMessageW(&Message);
 	}
 }
+
+#else // WCAP_CLI
+
+//
+// command line interface, records immediately (no countdown), no tray icon or hotkeys
+//
+
+#define WCAP_CLI_STOP_EVENT L"Local\\wcap-cli-stop"
+
+static HANDLE gCliDoneEvent;
+
+static void CliPrint(DWORD StdHandle, LPCWSTR Format, ...)
+{
+	WCHAR Text[2048];
+	va_list Args;
+	va_start(Args, Format);
+	_vsnwprintf(Text, _countof(Text), Format, Args);
+	va_end(Args);
+	Text[_countof(Text) - 1] = 0;
+	WriteText(StdHandle, Text);
+}
+
+static void CliUsage(void)
+{
+	CliPrint(STD_OUTPUT_HANDLE,
+		L"wcap-cli - screen recording from command line (records immediately, no countdown)\n"
+		L"\n"
+		L"usage:\n"
+		L"  wcap-cli list                         list monitors and capturable windows\n"
+		L"  wcap-cli record [target] [options]    record until --duration expires, Ctrl+C or 'wcap-cli stop'\n"
+		L"  wcap-cli stop                         stop all running 'wcap-cli record' processes\n"
+		L"\n"
+		L"target (default is primary monitor):\n"
+		L"  --monitor N          monitor index from 'list'\n"
+		L"  --window W           window handle (0x...) or case-insensitive title substring\n"
+		L"  --region X,Y,W,H     rectangle in virtual screen coordinates (must be on one monitor)\n"
+		L"\n"
+		L"options (defaults come from wcap-cli .ini file next to exe):\n"
+		L"  -o, --output FILE    output .mp4 path (default: <OutputFolder>\\<timestamp>.mp4)\n"
+		L"  -d, --duration SEC   stop after SEC seconds\n"
+		L"  --fps N              max framerate (0 = monitor refresh rate)\n"
+		L"  --bitrate KBPS       video bitrate in kbit/s\n"
+		L"  --max-width N        max video width, downscale if larger (0 = no limit)\n"
+		L"  --max-height N       max video height, downscale if larger (0 = no limit)\n"
+		L"  --audio / --no-audio enable or disable audio capture\n"
+		L"  --no-cursor          do not capture mouse cursor\n"
+		L"  --no-border          do not show yellow recording border (Windows 11)\n"
+		L"  --fragmented         fragmented mp4, stays playable if process is killed (H264 only)\n"
+		L"\n"
+		L"output (stdout): 'recording: PATH' when started, 'saved: PATH' when finished\n"
+		L"exit code: 0 on success, 1 on error\n");
+}
+
+static BOOL CliParseNumber(LPCWSTR Text, int* Value)
+{
+	LONGLONG Result;
+	if (!StrToInt64ExW(Text, STIF_SUPPORT_HEX, &Result))
+	{
+		return FALSE;
+	}
+	*Value = (int)Result;
+	return TRUE;
+}
+
+static BOOL CliParseRect(LPCWSTR Text, int Values[4])
+{
+	for (int i = 0; i < 4; i++)
+	{
+		int Sign = 1;
+		if (*Text == L'-')
+		{
+			Sign = -1;
+			Text++;
+		}
+		if (*Text < L'0' || *Text > L'9')
+		{
+			return FALSE;
+		}
+		int Value = 0;
+		while (*Text >= L'0' && *Text <= L'9')
+		{
+			Value = Value * 10 + (*Text++ - L'0');
+		}
+		Values[i] = Sign * Value;
+		if (i < 3)
+		{
+			if (*Text != L',')
+			{
+				return FALSE;
+			}
+			Text++;
+		}
+	}
+	return *Text == 0;
+}
+
+typedef struct
+{
+	int Index;
+	int Wanted; // -1 to list all
+	HMONITOR Result;
+}
+CliMonitorEnum;
+
+static BOOL CALLBACK CliMonitorProc(HMONITOR Monitor, HDC Context, LPRECT Rect, LPARAM Param)
+{
+	CliMonitorEnum* Enum = (CliMonitorEnum*)Param;
+	if (Enum->Wanted < 0)
+	{
+		MONITORINFOEXW Info = { .cbSize = sizeof(Info) };
+		GetMonitorInfoW(Monitor, (LPMONITORINFO)&Info);
+		CliPrint(STD_OUTPUT_HANDLE, L"monitor %d: %dx%d at %d,%d %ls%ls\n",
+			Enum->Index,
+			Info.rcMonitor.right - Info.rcMonitor.left,
+			Info.rcMonitor.bottom - Info.rcMonitor.top,
+			Info.rcMonitor.left, Info.rcMonitor.top,
+			Info.szDevice,
+			(Info.dwFlags & MONITORINFOF_PRIMARY) ? L" (primary)" : L"");
+	}
+	else if (Enum->Index == Enum->Wanted)
+	{
+		Enum->Result = Monitor;
+		return FALSE;
+	}
+	Enum->Index++;
+	return TRUE;
+}
+
+static BOOL CliIsCapturableWindow(HWND Window)
+{
+	if (!IsWindowVisible(Window) || GetWindowTextLengthW(Window) == 0)
+	{
+		return FALSE;
+	}
+	if (GetWindowLongW(Window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)
+	{
+		return FALSE;
+	}
+	BOOL Cloaked = FALSE;
+	if (SUCCEEDED(DwmGetWindowAttribute(Window, DWMWA_CLOAKED, &Cloaked, sizeof(Cloaked))) && Cloaked)
+	{
+		return FALSE;
+	}
+	return TRUE;
+}
+
+typedef struct
+{
+	LPCWSTR Title; // NULL to list all
+	HWND Result;
+	int Count;
+}
+CliWindowEnum;
+
+static BOOL CALLBACK CliWindowProc(HWND Window, LPARAM Param)
+{
+	CliWindowEnum* Enum = (CliWindowEnum*)Param;
+	if (!CliIsCapturableWindow(Window))
+	{
+		return TRUE;
+	}
+
+	WCHAR Title[256];
+	GetWindowTextW(Window, Title, _countof(Title));
+
+	if (Enum->Title == NULL)
+	{
+		RECT Rect;
+		GetWindowRect(Window, &Rect);
+		DWORD ProcessId;
+		GetWindowThreadProcessId(Window, &ProcessId);
+		CliPrint(STD_OUTPUT_HANDLE, L"window 0x%llx: %dx%d pid=%u \"%ls\"\n",
+			(UINT64)(ULONG_PTR)Window, Rect.right - Rect.left, Rect.bottom - Rect.top, ProcessId, Title);
+	}
+	else if (StrStrIW(Title, Enum->Title))
+	{
+		if (Enum->Count++ == 0)
+		{
+			Enum->Result = Window;
+		}
+	}
+	return TRUE;
+}
+
+static BOOL WINAPI CliCtrlHandler(DWORD Type)
+{
+	PostMessageW(gWindow, WM_WCAP_STOP_CAPTURE, 0, 0);
+	if (Type == CTRL_CLOSE_EVENT || Type == CTRL_LOGOFF_EVENT || Type == CTRL_SHUTDOWN_EVENT)
+	{
+		// process is terminated when handler returns, give encoder time to finalize mp4 file
+		WaitForSingleObject(gCliDoneEvent, 5000);
+	}
+	return TRUE;
+}
+
+static int CliList(void)
+{
+	CliMonitorEnum Monitors = { .Wanted = -1 };
+	EnumDisplayMonitors(NULL, NULL, &CliMonitorProc, (LPARAM)&Monitors);
+
+	CliWindowEnum Windows = { 0 };
+	EnumWindows(&CliWindowProc, (LPARAM)&Windows);
+	return 0;
+}
+
+static int CliStop(void)
+{
+	HANDLE Event = OpenEventW(EVENT_MODIFY_STATE, FALSE, WCAP_CLI_STOP_EVENT);
+	if (!Event)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: no recording in progress\n");
+		return 1;
+	}
+	SetEvent(Event);
+	CloseHandle(Event);
+	CliPrint(STD_OUTPUT_HANDLE, L"stop requested\n");
+	return 0;
+}
+
+static int CliRecord(int ArgCount, LPWSTR* Args)
+{
+	int MonitorIndex = -1;
+	LPCWSTR WindowArg = NULL;
+	BOOL HasRegion = FALSE;
+	int Region[4];
+	LPCWSTR Output = NULL;
+	int Duration = 0;
+
+	// parse arguments first, config values get overridden after loading .ini
+	int Fps = -1, Bitrate = -1, MaxWidth = -1, MaxHeight = -1, Audio = -1;
+	BOOL NoCursor = FALSE, NoBorder = FALSE, Fragmented = FALSE;
+
+	for (int i = 0; i < ArgCount; i++)
+	{
+		LPCWSTR Arg = Args[i];
+		LPCWSTR Next = i + 1 < ArgCount ? Args[i + 1] : NULL;
+
+		#define CLI_NEED_VALUE() do { if (!Next) { CliPrint(STD_ERROR_HANDLE, L"error: %ls requires a value\n", Arg); return 1; } i++; } while (0)
+		#define CLI_NUMBER(Var) do { CLI_NEED_VALUE(); if (!CliParseNumber(Next, &(Var)) || (Var) < 0) { CliPrint(STD_ERROR_HANDLE, L"error: invalid value for %ls: %ls\n", Arg, Next); return 1; } } while (0)
+
+		if (StrCmpW(Arg, L"--monitor") == 0)
+		{
+			CLI_NUMBER(MonitorIndex);
+		}
+		else if (StrCmpW(Arg, L"--window") == 0)
+		{
+			CLI_NEED_VALUE();
+			WindowArg = Next;
+		}
+		else if (StrCmpW(Arg, L"--region") == 0)
+		{
+			CLI_NEED_VALUE();
+			if (!CliParseRect(Next, Region) || Region[2] <= 0 || Region[3] <= 0)
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: --region expects X,Y,W,H with positive W and H\n");
+				return 1;
+			}
+			HasRegion = TRUE;
+		}
+		else if (StrCmpW(Arg, L"-o") == 0 || StrCmpW(Arg, L"--output") == 0)
+		{
+			CLI_NEED_VALUE();
+			Output = Next;
+		}
+		else if (StrCmpW(Arg, L"-d") == 0 || StrCmpW(Arg, L"--duration") == 0)
+		{
+			CLI_NUMBER(Duration);
+		}
+		else if (StrCmpW(Arg, L"--fps") == 0)        CLI_NUMBER(Fps);
+		else if (StrCmpW(Arg, L"--bitrate") == 0)    CLI_NUMBER(Bitrate);
+		else if (StrCmpW(Arg, L"--max-width") == 0)  CLI_NUMBER(MaxWidth);
+		else if (StrCmpW(Arg, L"--max-height") == 0) CLI_NUMBER(MaxHeight);
+		else if (StrCmpW(Arg, L"--audio") == 0)      Audio = 1;
+		else if (StrCmpW(Arg, L"--no-audio") == 0)   Audio = 0;
+		else if (StrCmpW(Arg, L"--no-cursor") == 0)  NoCursor = TRUE;
+		else if (StrCmpW(Arg, L"--no-border") == 0)  NoBorder = TRUE;
+		else if (StrCmpW(Arg, L"--fragmented") == 0) Fragmented = TRUE;
+		else
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: unknown argument: %ls\n", Arg);
+			return 1;
+		}
+
+		#undef CLI_NUMBER
+		#undef CLI_NEED_VALUE
+	}
+
+	if ((MonitorIndex >= 0) + (WindowArg != NULL) + (HasRegion != FALSE) > 1)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: use only one of --monitor, --window or --region\n");
+		return 1;
+	}
+
+	if (!ScreenCapture_IsSupported())
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: Windows 10 Version 1903 or newer is required\n");
+		return 1;
+	}
+
+	GetModuleFileNameW(NULL, gConfigPath, _countof(gConfigPath));
+	PathRenameExtensionW(gConfigPath, L".ini");
+
+	HR(CoInitializeEx(0, COINIT_APARTMENTTHREADED));
+
+	Config_Defaults(&gConfig);
+	Config_Load(&gConfig, gConfigPath);
+
+	gConfig.OpenFolder = FALSE;
+	if (Fps >= 0)       gConfig.VideoMaxFramerate = Fps;
+	if (Bitrate > 0)    gConfig.VideoBitrate = Bitrate;
+	if (MaxWidth >= 0)  gConfig.VideoMaxWidth = MaxWidth;
+	if (MaxHeight >= 0) gConfig.VideoMaxHeight = MaxHeight;
+	if (Audio >= 0)     gConfig.CaptureAudio = Audio;
+	if (NoCursor)       gConfig.MouseCursor = FALSE;
+	if (NoBorder)       gConfig.ShowRecordingBorder = FALSE;
+	if (Fragmented)     gConfig.FragmentedOutput = TRUE;
+	if (Duration > 0)
+	{
+		gConfig.EnableLimitLength = TRUE;
+		gConfig.LimitLength = Duration;
+	}
+	else
+	{
+		gConfig.EnableLimitLength = FALSE;
+	}
+
+	if (Output)
+	{
+		if (!GetFullPathNameW(Output, _countof(gCliOutputPath), gCliOutputPath, NULL))
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: invalid output path: %ls\n", Output);
+			return 1;
+		}
+		// output folder gets created by StartRecording
+		StrCpyW(gConfig.OutputFolder, gCliOutputPath);
+		PathRemoveFileSpecW(gConfig.OutputFolder);
+	}
+
+	// resolve capture target
+
+	HWND TargetWindow = NULL;
+	HMONITOR TargetMonitor = NULL;
+	RECT TargetRect;
+	BOOL UseRect = FALSE;
+
+	if (WindowArg)
+	{
+		int Handle;
+		if (WindowArg[0] == L'0' && (WindowArg[1] == L'x' || WindowArg[1] == L'X') && CliParseNumber(WindowArg, &Handle))
+		{
+			TargetWindow = (HWND)(ULONG_PTR)(UINT)Handle;
+			if (!IsWindow(TargetWindow))
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: window %ls does not exist\n", WindowArg);
+				return 1;
+			}
+		}
+		else
+		{
+			CliWindowEnum Enum = { .Title = WindowArg };
+			EnumWindows(&CliWindowProc, (LPARAM)&Enum);
+			if (Enum.Count == 0)
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: no window title contains \"%ls\"\n", WindowArg);
+				return 1;
+			}
+			if (Enum.Count > 1)
+			{
+				CliPrint(STD_ERROR_HANDLE, L"warning: %d windows match \"%ls\", using first one\n", Enum.Count, WindowArg);
+			}
+			TargetWindow = Enum.Result;
+		}
+
+		TargetWindow = GetCaptureWindow(TargetWindow);
+		if (!TargetWindow)
+		{
+			return 1;
+		}
+	}
+	else if (HasRegion)
+	{
+		RECT Rect = { Region[0], Region[1], Region[0] + Region[2], Region[1] + Region[3] };
+		TargetMonitor = MonitorFromRect(&Rect, MONITOR_DEFAULTTONULL);
+		if (!TargetMonitor)
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: region is not on any monitor\n");
+			return 1;
+		}
+
+		MONITORINFO Info = { .cbSize = sizeof(Info) };
+		GetMonitorInfoW(TargetMonitor, &Info);
+
+		IntersectRect(&Rect, &Rect, &Info.rcMonitor);
+		OffsetRect(&Rect, -Info.rcMonitor.left, -Info.rcMonitor.top);
+
+		// video encoder needs even sizes
+		Rect.right = Rect.left + ((Rect.right - Rect.left) & ~1);
+		Rect.bottom = Rect.top + ((Rect.bottom - Rect.top) & ~1);
+		if (IsRectEmpty(&Rect))
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: region is too small\n");
+			return 1;
+		}
+
+		TargetRect = Rect;
+		UseRect = TRUE;
+	}
+	else if (MonitorIndex >= 0)
+	{
+		CliMonitorEnum Enum = { .Wanted = MonitorIndex };
+		EnumDisplayMonitors(NULL, NULL, &CliMonitorProc, (LPARAM)&Enum);
+		if (!Enum.Result)
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: monitor %d does not exist, see 'wcap-cli list'\n", MonitorIndex);
+			return 1;
+		}
+		TargetMonitor = Enum.Result;
+	}
+	else
+	{
+		TargetMonitor = MonitorFromPoint((POINT){ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+	}
+
+	// setup same state as GUI, but with message-only window
+
+	ScreenCapture_Create(&gCapture, &OnCaptureFrame, false);
+	Encoder_Init(&gEncoder);
+	QueryPerformanceFrequency(&gTickFreq);
+
+	WNDCLASSEXW WindowClass =
+	{
+		.cbSize = sizeof(WindowClass),
+		.lpfnWndProc = WindowProc,
+		.hInstance = GetModuleHandleW(NULL),
+		.lpszClassName = L"wcap_cli_window_class",
+	};
+	ATOM Atom = RegisterClassExW(&WindowClass);
+	Assert(Atom);
+
+	gWindow = CreateWindowExW(0, WindowClass.lpszClassName, WCAP_TITLE, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, WindowClass.hInstance, NULL);
+	if (!gWindow)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: cannot create window\n");
+		return 1;
+	}
+
+	HANDLE StopEvent = CreateEventW(NULL, FALSE, FALSE, WCAP_CLI_STOP_EVENT);
+	gCliDoneEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+	SetConsoleCtrlHandler(&CliCtrlHandler, TRUE);
+
+	// start recording right away
+
+	if (TargetWindow)
+	{
+		CaptureWindow(TargetWindow);
+	}
+	else
+	{
+		CaptureMonitor(TargetMonitor, UseRect ? &TargetRect : NULL);
+	}
+
+	if (!gRecording)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: cannot start recording\n");
+		return 1;
+	}
+
+	CliPrint(STD_OUTPUT_HANDLE, L"recording: %ls\nvideo: %ux%u @ %.2f fps\n",
+		gRecordingPath, gEncoder.OutputWidth, gEncoder.OutputHeight,
+		(float)gEncoder.FramerateNum / (float)gEncoder.FramerateDen);
+
+	if (Duration > 0)
+	{
+		// in case no new frames arrive (static screen) stop anyway, give frame based limit a bit of time first
+		SetTimer(gWindow, WCAP_CLI_DURATION_TIMER, Duration * 1000 + 500, NULL);
+	}
+
+	gCliExitCode = 1;
+	for (;;)
+	{
+		DWORD Wait = MsgWaitForMultipleObjects(1, &StopEvent, FALSE, INFINITE, QS_ALLINPUT);
+		if (Wait == WAIT_OBJECT_0 && gRecording)
+		{
+			StopRecording();
+		}
+
+		MSG Message;
+		while (PeekMessageW(&Message, NULL, 0, 0, PM_REMOVE))
+		{
+			if (Message.message == WM_QUIT)
+			{
+				SetEvent(gCliDoneEvent);
+				return gCliExitCode;
+			}
+			TranslateMessage(&Message);
+			DispatchMessageW(&Message);
+		}
+	}
+}
+
+static int CliMain(int ArgCount, LPWSTR* Args)
+{
+	if (ArgCount < 2 || StrCmpW(Args[1], L"help") == 0 || StrCmpW(Args[1], L"--help") == 0 || StrCmpW(Args[1], L"-h") == 0)
+	{
+		CliUsage();
+		return ArgCount < 2 ? 1 : 0;
+	}
+	if (StrCmpW(Args[1], L"list") == 0)
+	{
+		return CliList();
+	}
+	if (StrCmpW(Args[1], L"stop") == 0)
+	{
+		return CliStop();
+	}
+	if (StrCmpW(Args[1], L"record") == 0)
+	{
+		return CliRecord(ArgCount - 2, Args + 2);
+	}
+
+	CliPrint(STD_ERROR_HANDLE, L"error: unknown command: %ls, see 'wcap-cli help'\n", Args[1]);
+	return 1;
+}
+
+#ifndef NDEBUG
+int main(void)
+#else
+void mainCRTStartup(void)
+#endif
+{
+	int ArgCount;
+	LPWSTR* Args = CommandLineToArgvW(GetCommandLineW(), &ArgCount);
+	ExitProcess(CliMain(ArgCount, Args));
+}
+
+#endif // WCAP_CLI

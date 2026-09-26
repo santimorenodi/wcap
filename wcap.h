@@ -41,3 +41,27 @@
 
 #include <stdio.h>
 #define StrFormat(Buffer, ...) _snwprintf(Buffer, _countof(Buffer), __VA_ARGS__)
+
+// writes UTF-8 text to console/pipe handle (STD_OUTPUT_HANDLE or STD_ERROR_HANDLE)
+static void WriteText(DWORD StdHandle, LPCWSTR Text)
+{
+	char Buffer[4096];
+	int Length = WideCharToMultiByte(CP_UTF8, 0, Text, -1, Buffer, sizeof(Buffer), NULL, NULL);
+	if (Length > 1)
+	{
+		DWORD Written;
+		WriteFile(GetStdHandle(StdHandle), Buffer, Length - 1, &Written, NULL);
+	}
+}
+
+// in CLI build errors go to stderr instead of blocking message box
+static void ErrorMessage(LPCWSTR Text)
+{
+#if defined(WCAP_CLI)
+	WriteText(STD_ERROR_HANDLE, L"error: ");
+	WriteText(STD_ERROR_HANDLE, Text);
+	WriteText(STD_ERROR_HANDLE, L"\n");
+#else
+	MessageBoxW(NULL, Text, WCAP_TITLE, MB_ICONERROR);
+#endif
+}

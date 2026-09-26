@@ -25,6 +25,37 @@ Features
  * when limiting max width/height - can perform **gamma correct resize**
  * optional **improved color conversion** - adjust output YUV values to better match brightness to original RGB input
 
+Countdown
+=========
+
+When recording is started with a keyboard shortcut, a 3, 2, 1 countdown is shown centered over the area that will be
+recorded (for region capture - after pressing ENTER). The countdown window is excluded from capture, so it never appears
+in the video. Pressing any wcap shortcut during countdown cancels it. Countdown length can be changed with `Countdown=N`
+(seconds, `0` disables it) in the `[wcap]` section of the .ini file next to the exe.
+
+Command line (wcap-cli)
+=======================
+
+`build.cmd` also produces `wcap-cli-x64.exe`, a console version that records immediately (no countdown, no tray icon,
+no hotkeys) and is meant for scripts & automation. It can run next to the tray version.
+
+    wcap-cli list                                   list monitors (with index) and capturable windows (with handle)
+    wcap-cli record [target] [options]              record until --duration expires, Ctrl+C or "wcap-cli stop"
+    wcap-cli stop                                   stop all running "wcap-cli record" processes
+
+    target:   --monitor N | --window 0xHANDLE | --window "title substring" | --region X,Y,W,H   (default: primary monitor)
+    options:  -o FILE.mp4, -d SECONDS, --fps N, --bitrate KBPS, --max-width N, --max-height N,
+              --audio, --no-audio, --no-cursor, --no-border, --fragmented
+
+Examples:
+
+    wcap-cli record --monitor 1 -d 10 -o demo.mp4
+    wcap-cli record --window "Chrome" --no-audio -d 5 -o chrome.mp4
+    wcap-cli record --region 100,100,1280,720 -o region.mp4     (then later: wcap-cli stop)
+
+It prints `recording: PATH` when started and `saved: PATH` with file size when finished, exit code is 0 on success.
+Other settings are read from `wcap-cli-x64.ini` next to the exe (same keys as the tray version).
+
 Details
 =======
 

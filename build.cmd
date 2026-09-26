@@ -20,7 +20,7 @@ if "%ARGS:x64=%" neq "!ARGS!" (
 
 where /Q cl.exe || (
   set __VSCMD_ARG_NO_LOGO=1
-  for /f "tokens=*" %%i in ('"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.VisualStudio.Workload.NativeDesktop -property installationPath') do set VS=%%i
+  for /f "tokens=*" %%i in ('"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath') do set VS=%%i
   if "!VS!" equ "" (
     echo ERROR: Visual Studio installation not found
     exit /b 1
@@ -54,6 +54,7 @@ for /f %%i in ('call git describe --always --dirty') do set CL=%CL% -DWCAP_GIT_I
 
 rc.exe /nologo wcap.rc || exit /b 1
 cl.exe /nologo /std:c11 /experimental:c11atomics /W3 /WX wcap.c wcap.res /Fewcap-%TARGET_ARCH%.exe /link /INCREMENTAL:NO /MANIFEST:EMBED /MANIFESTINPUT:wcap.manifest /SUBSYSTEM:WINDOWS || exit /b 1
+cl.exe /nologo /std:c11 /experimental:c11atomics /W3 /WX /DWCAP_CLI wcap.c wcap.res /Fewcap-cli-%TARGET_ARCH%.exe /link /INCREMENTAL:NO /MANIFEST:EMBED /MANIFESTINPUT:wcap.manifest /SUBSYSTEM:CONSOLE || exit /b 1
 del *.obj *.res >nul
 
 goto :eof
