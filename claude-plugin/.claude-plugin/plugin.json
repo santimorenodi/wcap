@@ -1,0 +1,13 @@
+{
+  "name": "wcap",
+  "version": "1.0.0",
+  "description": "Skills for recording the screen, a window or a region to mp4 on Windows with wcap-cli (Windows.Graphics.Capture + Media Foundation)",
+  "author": {
+    "name": "santimorenodi",
+    "url": "https://github.com/santimorenodi"
+  },
+  "homepage": "https://github.com/santimorenodi/wcap",
+  "repository": "https://github.com/santimorenodi/wcap",
+  "license": "Unlicense",
+  "keywords": ["screen-recording", "video", "windows", "mp4", "capture"]
+}

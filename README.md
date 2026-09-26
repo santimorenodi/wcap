@@ -56,6 +56,18 @@ Examples:
 It prints `recording: PATH` when started and `saved: PATH` with file size when finished, exit code is 0 on success.
 Other settings are read from `wcap-cli-x64.ini` next to the exe (same keys as the tray version).
 
+Claude Code plugin
+==================
+
+This repo is also a [Claude Code](https://claude.com/claude-code) plugin marketplace. The `wcap` plugin adds skills
+that teach Claude to record the screen with `wcap-cli` (`record-screen`) and to build & configure wcap (`setup-wcap`):
+
+    /plugin marketplace add santimorenodi/wcap
+    /plugin install wcap@wcap
+
+The plugin only contains instructions; `wcap-cli-<arch>.exe` must be built (see `setup-wcap`) and be on `PATH`,
+in `WCAP_CLI`, or in the repo folder.
+
 Details
 =======
 

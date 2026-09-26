@@ -1,0 +1,18 @@
+{
+  "name": "wcap",
+  "owner": {
+    "name": "santimorenodi",
+    "url": "https://github.com/santimorenodi"
+  },
+  "metadata": {
+    "description": "Claude Code plugin for recording the screen to mp4 with wcap-cli"
+  },
+  "plugins": [
+    {
+      "name": "wcap",
+      "source": "./claude-plugin",
+      "description": "Record the screen, a window or a region to mp4 on Windows with wcap-cli",
+      "version": "1.0.0"
+    }
+  ]
+}
