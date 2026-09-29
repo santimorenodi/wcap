@@ -39,6 +39,7 @@ Prints monitors (`monitor N: WxH at X,Y \\.\DISPLAYn (primary)`) and capturable 
 | `--window 0x1234ab` | exact window handle from `list` (preferred, unambiguous) |
 | `--window "Chrome"` | first window whose title contains the text (case-insensitive, warns if several match) |
 | `--region X,Y,W,H` | rectangle in virtual screen coordinates, must lie on one monitor (odd sizes are rounded down to even) |
+| `--crop X,Y,W,H` | crop of the captured area, relative to its top-left corner (of the window, or of the monitor/region). Prefer this over `--region` for a part of a window: it keeps working if the window moves |
 
 ## 3. Record
 
@@ -58,6 +59,12 @@ Options:
 - `--audio` / `--no-audio` system audio; for window capture only that app's audio is recorded
 - `--no-cursor` hide mouse cursor, `--no-border` hide yellow capture border (Windows 11)
 - `--fragmented` fragmented mp4 that stays playable even if the process is killed (H264 only)
+- `--fps match` / `--vfr` only new frames: frames identical to the previous one are not written (variable framerate). Use this when the source renders below the monitor refresh rate, otherwise the clip contains repeated frames
+- `--json` print the result as one JSON object: `{"saved":...,"frames":N,"unique_frames":N,"duplicated":N,"written_frames":N,"effective_fps":F,"dropped":N,"warnings":[...]}`
+- `--timestamps` write `<clip>.frames.json` with the capture time of every frame (`qpc` ticks, `t` seconds since first frame = mp4 pts, `unique`, `out` = frame index in the clip or -1)
+- `--measure-flicker` (+ `--measure-region X,Y,W,H`, repeatable, relative to the captured frame before `--max-width` scaling) mean absolute difference between consecutive captured frames, measured on uncompressed frames, in the summary / JSON `flicker`
+- `--lossless` / `--frames-dir DIR` write a PNG sequence (`frame_000000.png`, ...) instead of mp4, no compression noise
+- `--start-on event:NAME|file:PATH` prepare everything and start capturing only when the event is signaled (`wcap-cli signal NAME`) or the file exists; `--start-timeout SEC` to give up. Prints `waiting: ...` when ready (stdout, or stderr with `--json`)
 
 Output on stdout, exit code 0 on success:
 
@@ -93,6 +100,19 @@ ffmpeg -v error -y -ss 1 -i clip.mp4 -frames:v 1 -vf scale=640:-1 frame.png
 ```
 
 Then open `frame.png` with the Read tool to see it.
+
+## Other commands
+
+```bash
+wcap-cli-x64.exe list --json --filter "Unity"          # windows/monitors as JSON, only titles containing the text
+wcap-cli-x64.exe snapshot --window 0x20b0c --crop 8,40,1280,720 -o "C:\path\frame.png"   # one png, no video needed
+wcap-cli-x64.exe diff before.mp4 after.mp4 --region 0,0,400,300 --json   # frame to frame difference, per region
+wcap-cli-x64.exe sheet before.mp4 after.mp4 --at 0.6,3.0 -o "C:\path\compare.png"       # rows = clips, columns = times
+wcap-cli-x64.exe sheet clip.mp4 --count 6 --grid -o sheet.png                              # contact sheet
+```
+
+`diff` numbers are the mean absolute difference per channel (0..255) between consecutive frames: `mean` counts identical frames as 0,
+`mean_nonzero` only frames that changed. With two clips it also gives the difference of frame N of A against frame N of B and the ratio B/A.
 
 ## Notes
 

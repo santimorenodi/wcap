@@ -12,6 +12,10 @@
 #include <shellapi.h>
 #include <windowsx.h>
 
+#if defined(WCAP_CLI)
+#include "wcap_cli_tools.h"
+#endif
+
 #pragma comment (lib, "ntdll")
 #pragma comment (lib, "kernel32")
 #pragma comment (lib, "user32")
@@ -145,6 +149,10 @@ static Encoder gEncoder;
 #if defined(WCAP_CLI)
 static WCHAR gCliOutputPath[MAX_PATH];
 static int gCliExitCode = 1;
+static HANDLE gCliStopEvent;  // set by 'wcap-cli stop'
+static HANDLE gCliAbortEvent; // set by Ctrl+C, interrupts waiting for start signal
+static void CliReportFinished(void);
+static BOOL CliWaitStart(void);
 #endif
 
 static void ShowNotification(LPCWSTR Message, LPCWSTR Title, DWORD Flags)
@@ -241,6 +249,21 @@ static void ShowFileInFolder(LPCWSTR Filename)
 
 static void StartRecording(ID3D11Device* Device, HWND Window)
 {
+#if defined(WCAP_CLI)
+	if (gCapture.Rect.right <= gCapture.Rect.left || gCapture.Rect.bottom <= gCapture.Rect.top)
+	{
+		ErrorMessage(L"Capture area is empty (window minimized, or crop is outside of captured area)");
+		ScreenCapture_Stop(&gCapture);
+		ID3D11Device_Release(Device);
+		return;
+	}
+	if (gCapture.HasCrop && (gCapture.Rect.right - gCapture.Rect.left != gCapture.Crop.right - gCapture.Crop.left ||
+		gCapture.Rect.bottom - gCapture.Rect.top != gCapture.Crop.bottom - gCapture.Crop.top))
+	{
+		CliWarn(L"crop does not fit into captured area, using %dx%d", gCapture.Rect.right - gCapture.Rect.left, gCapture.Rect.bottom - gCapture.Rect.top);
+	}
+#endif
+
 	SYSTEMTIME Time;
 	GetLocalTime(&Time);
 
@@ -292,6 +315,16 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 		.Config = &gConfig,
 	};
 
+#if defined(WCAP_CLI)
+	if (gCli.FramesOnly)
+	{
+		// png sequence, no mp4 and no audio
+		gConfig.CaptureAudio = FALSE;
+		SHCreateDirectoryExW(NULL, gCli.FramesDir, NULL);
+		StrCpyW(gRecordingPath, gCli.FramesDir);
+	}
+#endif
+
 	if (gConfig.CaptureAudio)
 	{
 		HWND ApplicationWindow = gConfig.ApplicationLocalAudio && AudioCapture_CanCaptureApplicationLocal() ? Window : NULL;
@@ -305,7 +338,13 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 		EncConfig.AudioFormat = gAudio.Format;
 	}
 
-	if (!Encoder_Start(&gEncoder, Device, gRecordingPath, &EncConfig))
+#if defined(WCAP_CLI)
+	BOOL UseEncoder = !gCli.FramesOnly;
+#else
+	BOOL UseEncoder = TRUE;
+#endif
+
+	if (UseEncoder && !Encoder_Start(&gEncoder, Device, gRecordingPath, &EncConfig))
 	{
 		if (gConfig.CaptureAudio)
 		{
@@ -315,6 +354,31 @@ static void StartRecording(ID3D11Device* Device, HWND Window)
 		ID3D11Device_Release(Device);
 		return;
 	}
+
+#if defined(WCAP_CLI)
+	if (gCli.FramesOnly)
+	{
+		CliPngQueue_Start(&gCli.Png, EncConfig.Width, EncConfig.Height);
+	}
+
+	// everything is ready, wait for start signal so recording begins right when it arrives
+	if (!CliWaitStart())
+	{
+		if (gConfig.CaptureAudio)
+		{
+			AudioCapture_Stop(&gAudio);
+		}
+		if (UseEncoder)
+		{
+			Encoder_Stop(&gEncoder);
+			DeleteFileW(gRecordingPath);
+		}
+		CliPngQueue_Finish(&gCli.Png);
+		ScreenCapture_Stop(&gCapture);
+		ID3D11Device_Release(Device);
+		return;
+	}
+#endif
 
 	gRecordingNextTooltip = 0;
 	gRecordingNextEncode = 0;
@@ -395,6 +459,9 @@ static void StopRecording(void)
 	KillTimer(gWindow, WCAP_VIDEO_UPDATE_TIMER);
 
 	ScreenCapture_Stop(&gCapture);
+#if defined(WCAP_CLI)
+	if (!gCli.FramesOnly)
+#endif
 	Encoder_Stop(&gEncoder);
 	if (gConfig.OpenFolder)
 	{
@@ -409,17 +476,7 @@ static void StopRecording(void)
 
 #if defined(WCAP_CLI)
 	KillTimer(gWindow, WCAP_CLI_DURATION_TIMER);
-
-	WIN32_FILE_ATTRIBUTE_DATA Attributes;
-	UINT64 FileSize = 0;
-	if (GetFileAttributesExW(gRecordingPath, GetFileExInfoStandard, &Attributes))
-	{
-		FileSize = ((UINT64)Attributes.nFileSizeHigh << 32) | Attributes.nFileSizeLow;
-	}
-
-	WCHAR Text[1024];
-	StrFormat(Text, L"saved: %ls\nsize: %I64u bytes\ndropped_frames: %u\n", gRecordingPath, FileSize, gRecordingDroppedFrames);
-	WriteText(STD_OUTPUT_HANDLE, Text);
+	CliReportFinished();
 
 	gCliExitCode = 0;
 	PostQuitMessage(0);
@@ -1174,6 +1231,9 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 			{
 				LARGE_INTEGER Time;
 				QueryPerformanceCounter(&Time);
+#if defined(WCAP_CLI)
+				if (!gCli.FramesOnly)
+#endif
 				Encoder_Update(&gEncoder, Time.QuadPart, gTickFreq.QuadPart);
 				return 0;
 			}
@@ -1308,7 +1368,12 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	}
 	else if (Message == WM_WCAP_TRAY_TITLE)
 	{
+#if defined(WCAP_CLI)
+		// no tray icon in cli, also there is no encoder when recording png sequence
+		if (FALSE)
+#else
 		if (gRecording)
+#endif
 		{
 			UINT64 FileSize;
 			DWORD Bitrate, LengthMsec;
@@ -1534,6 +1599,9 @@ static bool OnCaptureFrame(ScreenCapture* Capture, ScreenCaptureFrame* Frame)
 		if (Frame->Time * LimitFramerate < gRecordingNextEncode)
 		{
 			DoEncode = FALSE;
+#if defined(WCAP_CLI)
+			gCli.LimitedByFps++;
+#endif
 		}
 		else
 		{
@@ -1552,13 +1620,30 @@ static bool OnCaptureFrame(ScreenCapture* Capture, ScreenCaptureFrame* Frame)
 	}
 	gRecordingLastFrame = Frame->Time;
 
+#if defined(WCAP_CLI)
+	if (DoEncode)
+	{
+		// duplicate detection, png output, frame log
+		DoEncode = CliOnFrame(Frame);
+	}
+#endif
+
 	if (DoEncode)
 	{
 		if (!Encoder_NewFrame(&gEncoder, Frame->Texture, Frame->Rect, Frame->Time, gTickFreq.QuadPart))
 		{
 			// TODO: maybe highlight tray icon when droppped frames are increasing too much?
 			gRecordingDroppedFrames++;
+#if defined(WCAP_CLI)
+			CliFrameDropped();
+#endif
 		}
+#if defined(WCAP_CLI)
+		else
+		{
+			CliFrameEncoded();
+		}
+#endif
 	}
 
 	if (gConfig.EnableLimitLength || gConfig.EnableLimitSize)
@@ -1567,7 +1652,12 @@ static bool OnCaptureFrame(ScreenCapture* Capture, ScreenCaptureFrame* Frame)
 
 		if (gConfig.EnableLimitLength)
 		{
-			if (Frame->Time - gEncoder.StartTime >= (UINT64)(gConfig.LimitLength * gTickFreq.QuadPart))
+#if defined(WCAP_CLI)
+			UINT64 StartTime = gCli.FramesOnly ? gCli.FirstQpc : gEncoder.StartTime;
+#else
+			UINT64 StartTime = gEncoder.StartTime;
+#endif
+			if (Frame->Time - StartTime >= (UINT64)(gConfig.LimitLength * gTickFreq.QuadPart))
 			{
 				Stop = TRUE;
 			}
@@ -1743,13 +1833,14 @@ void WinMainCRTStartup()
 // command line interface, records immediately (no countdown), no tray icon or hotkeys
 //
 
-#define WCAP_CLI_STOP_EVENT L"Local\\wcap-cli-stop"
+#define WCAP_CLI_STOP_EVENT  L"Local\\wcap-cli-stop"
+#define WCAP_CLI_START_EVENT L"Local\\wcap-cli-start-"
 
 static HANDLE gCliDoneEvent;
 
 static void CliPrint(DWORD StdHandle, LPCWSTR Format, ...)
 {
-	WCHAR Text[2048];
+	WCHAR Text[8192];
 	va_list Args;
 	va_start(Args, Format);
 	_vsnwprintf(Text, _countof(Text), Format, Args);
@@ -1764,19 +1855,25 @@ static void CliUsage(void)
 		L"wcap-cli - screen recording from command line (records immediately, no countdown)\n"
 		L"\n"
 		L"usage:\n"
-		L"  wcap-cli list                         list monitors and capturable windows\n"
-		L"  wcap-cli record [target] [options]    record until --duration expires, Ctrl+C or 'wcap-cli stop'\n"
-		L"  wcap-cli stop                         stop all running 'wcap-cli record' processes\n"
+		L"  wcap-cli list [--json] [--filter TEXT]   list monitors and capturable windows\n"
+		L"  wcap-cli record [target] [options]       record until --duration expires, Ctrl+C or 'wcap-cli stop'\n"
+		L"  wcap-cli stop                            stop all running 'wcap-cli record' processes\n"
+		L"  wcap-cli signal NAME                     start a recording that waits with '--start-on NAME'\n"
+		L"  wcap-cli snapshot [target] -o FILE.png   save one frame as png\n"
+		L"  wcap-cli diff A.mp4 [B.mp4] [--region X,Y,W,H]...   frame to frame difference of clips, in numbers\n"
+		L"  wcap-cli sheet CLIP.mp4... [--at T,T,...]           contact sheet png with frames at given times\n"
 		L"\n"
 		L"target (default is primary monitor):\n"
 		L"  --monitor N          monitor index from 'list'\n"
 		L"  --window W           window handle (0x...) or case-insensitive title substring\n"
 		L"  --region X,Y,W,H     rectangle in virtual screen coordinates (must be on one monitor)\n"
+		L"  --crop X,Y,W,H       crop of captured area, relative to top-left of window (or of monitor/region)\n"
 		L"\n"
-		L"options (defaults come from wcap-cli .ini file next to exe):\n"
+		L"record options (defaults come from wcap-cli .ini file next to exe):\n"
 		L"  -o, --output FILE    output .mp4 path (default: <OutputFolder>\\<timestamp>.mp4)\n"
 		L"  -d, --duration SEC   stop after SEC seconds\n"
-		L"  --fps N              max framerate (0 = monitor refresh rate)\n"
+		L"  --fps N              max framerate (0 = monitor refresh rate), 'match' = only new frames, no limit\n"
+		L"  --vfr                variable framerate: do not write frames identical to the previous one\n"
 		L"  --bitrate KBPS       video bitrate in kbit/s\n"
 		L"  --max-width N        max video width, downscale if larger (0 = no limit)\n"
 		L"  --max-height N       max video height, downscale if larger (0 = no limit)\n"
@@ -1784,6 +1881,18 @@ static void CliUsage(void)
 		L"  --no-cursor          do not capture mouse cursor\n"
 		L"  --no-border          do not show yellow recording border (Windows 11)\n"
 		L"  --fragmented         fragmented mp4, stays playable if process is killed (H264 only)\n"
+		L"  --lossless           no mp4, write lossless png sequence to <output without .mp4>_frames folder\n"
+		L"  --frames-dir DIR     like --lossless but to given folder (frame_000000.png, ...)\n"
+		L"  --start-on SPEC      create everything, then wait to begin capture: 'event:NAME' (see 'signal') or\n"
+		L"                       'file:PATH' (starts when file exists). Without prefix: file if it looks like a path\n"
+		L"  --start-timeout SEC  give up waiting for --start-on after SEC seconds (default: wait forever)\n"
+		L"  --timestamps         write <clip>.frames.json with capture time of every frame\n"
+		L"  --measure-flicker    mean difference between consecutive captured frames (uncompressed), whole frame\n"
+		L"  --measure-region R   also measure region X,Y,W,H of the captured frame (before --max-width scaling), can be repeated\n"
+		L"  --json               print result as one JSON object on stdout\n"
+		L"\n"
+		L"other commands: -o FILE, --json for snapshot/diff/sheet\n"
+		L"  sheet: --at T,T,..  --every SEC  --count N  --grid  --cols N  --width PX  --region X,Y,W,H  --no-labels\n"
 		L"\n"
 		L"output (stdout): 'recording: PATH' when started, 'saved: PATH' when finished\n"
 		L"exit code: 0 on success, 1 on error\n");
@@ -1832,11 +1941,17 @@ static BOOL CliParseRect(LPCWSTR Text, int Values[4])
 	return *Text == 0;
 }
 
+static BOOL CliIsHandle(LPCWSTR Text)
+{
+	return Text[0] == L'0' && (Text[1] == L'x' || Text[1] == L'X');
+}
+
 typedef struct
 {
 	int Index;
 	int Wanted; // -1 to list all
 	HMONITOR Result;
+	CliText* Json; // when not NULL, listing is done as JSON
 }
 CliMonitorEnum;
 
@@ -1847,13 +1962,26 @@ static BOOL CALLBACK CliMonitorProc(HMONITOR Monitor, HDC Context, LPRECT Rect, 
 	{
 		MONITORINFOEXW Info = { .cbSize = sizeof(Info) };
 		GetMonitorInfoW(Monitor, (LPMONITORINFO)&Info);
-		CliPrint(STD_OUTPUT_HANDLE, L"monitor %d: %dx%d at %d,%d %ls%ls\n",
-			Enum->Index,
-			Info.rcMonitor.right - Info.rcMonitor.left,
-			Info.rcMonitor.bottom - Info.rcMonitor.top,
-			Info.rcMonitor.left, Info.rcMonitor.top,
-			Info.szDevice,
-			(Info.dwFlags & MONITORINFOF_PRIMARY) ? L" (primary)" : L"");
+		BOOL Primary = (Info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+		if (Enum->Json)
+		{
+			CliText_Printf(Enum->Json, L"%ls{\"index\":%d,\"width\":%d,\"height\":%d,\"x\":%d,\"y\":%d,\"device\":",
+				Enum->Index ? L"," : L"", Enum->Index,
+				Info.rcMonitor.right - Info.rcMonitor.left, Info.rcMonitor.bottom - Info.rcMonitor.top,
+				Info.rcMonitor.left, Info.rcMonitor.top);
+			CliText_Json(Enum->Json, Info.szDevice);
+			CliText_Printf(Enum->Json, L",\"primary\":%ls}", Primary ? L"true" : L"false");
+		}
+		else
+		{
+			CliPrint(STD_OUTPUT_HANDLE, L"monitor %d: %dx%d at %d,%d %ls%ls\n",
+				Enum->Index,
+				Info.rcMonitor.right - Info.rcMonitor.left,
+				Info.rcMonitor.bottom - Info.rcMonitor.top,
+				Info.rcMonitor.left, Info.rcMonitor.top,
+				Info.szDevice,
+				Primary ? L" (primary)" : L"");
+		}
 	}
 	else if (Enum->Index == Enum->Wanted)
 	{
@@ -1884,7 +2012,9 @@ static BOOL CliIsCapturableWindow(HWND Window)
 
 typedef struct
 {
-	LPCWSTR Title; // NULL to list all
+	LPCWSTR Title;  // NULL to list all
+	LPCWSTR Filter; // when listing, only windows with this text in title
+	CliText* Json;  // when not NULL, listing is done as JSON
 	HWND Result;
 	int Count;
 }
@@ -1903,12 +2033,30 @@ static BOOL CALLBACK CliWindowProc(HWND Window, LPARAM Param)
 
 	if (Enum->Title == NULL)
 	{
+		if (Enum->Filter && !StrStrIW(Title, Enum->Filter))
+		{
+			return TRUE;
+		}
+
 		RECT Rect;
 		GetWindowRect(Window, &Rect);
 		DWORD ProcessId;
 		GetWindowThreadProcessId(Window, &ProcessId);
-		CliPrint(STD_OUTPUT_HANDLE, L"window 0x%llx: %dx%d pid=%u \"%ls\"\n",
-			(UINT64)(ULONG_PTR)Window, Rect.right - Rect.left, Rect.bottom - Rect.top, ProcessId, Title);
+		if (Enum->Json)
+		{
+			CliText_Printf(Enum->Json, L"%ls{\"handle\":\"0x%llx\",\"width\":%d,\"height\":%d,\"x\":%d,\"y\":%d,\"pid\":%u,\"minimized\":%ls,\"title\":",
+				Enum->Count ? L"," : L"", (UINT64)(ULONG_PTR)Window,
+				Rect.right - Rect.left, Rect.bottom - Rect.top, Rect.left, Rect.top, ProcessId,
+				IsIconic(Window) ? L"true" : L"false");
+			CliText_Json(Enum->Json, Title);
+			CliText_Char(Enum->Json, L'}');
+		}
+		else
+		{
+			CliPrint(STD_OUTPUT_HANDLE, L"window 0x%llx: %dx%d pid=%u \"%ls\"\n",
+				(UINT64)(ULONG_PTR)Window, Rect.right - Rect.left, Rect.bottom - Rect.top, ProcessId, Title);
+		}
+		Enum->Count++;
 	}
 	else if (StrStrIW(Title, Enum->Title))
 	{
@@ -1922,6 +2070,10 @@ static BOOL CALLBACK CliWindowProc(HWND Window, LPARAM Param)
 
 static BOOL WINAPI CliCtrlHandler(DWORD Type)
 {
+	if (gCliAbortEvent)
+	{
+		SetEvent(gCliAbortEvent);
+	}
 	PostMessageW(gWindow, WM_WCAP_STOP_CAPTURE, 0, 0);
 	if (Type == CTRL_CLOSE_EVENT || Type == CTRL_LOGOFF_EVENT || Type == CTRL_SHUTDOWN_EVENT)
 	{
@@ -1931,13 +2083,53 @@ static BOOL WINAPI CliCtrlHandler(DWORD Type)
 	return TRUE;
 }
 
-static int CliList(void)
+static int CliList(int ArgCount, LPWSTR* Args)
 {
-	CliMonitorEnum Monitors = { .Wanted = -1 };
-	EnumDisplayMonitors(NULL, NULL, &CliMonitorProc, (LPARAM)&Monitors);
+	BOOL Json = FALSE;
+	LPCWSTR Filter = NULL;
+	for (int i = 0; i < ArgCount; i++)
+	{
+		if (StrCmpW(Args[i], L"--json") == 0)
+		{
+			Json = TRUE;
+		}
+		else if (StrCmpW(Args[i], L"--filter") == 0 && i + 1 < ArgCount)
+		{
+			Filter = Args[++i];
+		}
+		else
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: unknown argument: %ls\n", Args[i]);
+			return 1;
+		}
+	}
 
-	CliWindowEnum Windows = { 0 };
-	EnumWindows(&CliWindowProc, (LPARAM)&Windows);
+	CliText Monitors = { 0 };
+	CliText Windows = { 0 };
+
+	CliMonitorEnum MonitorEnum = { .Wanted = -1, .Json = Json ? &Monitors : NULL };
+	EnumDisplayMonitors(NULL, NULL, &CliMonitorProc, (LPARAM)&MonitorEnum);
+
+	CliWindowEnum WindowEnum = { .Filter = Filter, .Json = Json ? &Windows : NULL };
+	EnumWindows(&CliWindowProc, (LPARAM)&WindowEnum);
+
+	if (Json)
+	{
+		CliText Out = { 0 };
+		CliText_Printf(&Out, L"{\"monitors\":[");
+		// texts can be longer than printf buffer, append them directly
+		for (LPCWSTR p = Monitors.Data ? Monitors.Data : L""; *p; p++)
+		{
+			CliText_Char(&Out, *p);
+		}
+		CliText_Printf(&Out, L"],\"windows\":[");
+		for (LPCWSTR p = Windows.Data ? Windows.Data : L""; *p; p++)
+		{
+			CliText_Char(&Out, *p);
+		}
+		CliText_Printf(&Out, L"]}\n");
+		CliText_Print(STD_OUTPUT_HANDLE, &Out);
+	}
 	return 0;
 }
 
@@ -1949,90 +2141,307 @@ static int CliStop(void)
 		CliPrint(STD_ERROR_HANDLE, L"error: no recording in progress\n");
 		return 1;
 	}
+	// event is manual reset so every recording (also ones still waiting for start signal) sees it,
+	// give them a moment to react and then reset it so that recordings started later are not affected
 	SetEvent(Event);
+	Sleep(300);
+	ResetEvent(Event);
 	CloseHandle(Event);
 	CliPrint(STD_OUTPUT_HANDLE, L"stop requested\n");
 	return 0;
 }
 
-static int CliRecord(int ArgCount, LPWSTR* Args)
+static void CliStartEventName(LPCWSTR Name, WCHAR* Full, size_t Count)
 {
-	int MonitorIndex = -1;
-	LPCWSTR WindowArg = NULL;
-	BOOL HasRegion = FALSE;
-	int Region[4];
-	LPCWSTR Output = NULL;
-	int Duration = 0;
-
-	// parse arguments first, config values get overridden after loading .ini
-	int Fps = -1, Bitrate = -1, MaxWidth = -1, MaxHeight = -1, Audio = -1;
-	BOOL NoCursor = FALSE, NoBorder = FALSE, Fragmented = FALSE;
-
-	for (int i = 0; i < ArgCount; i++)
+	if (StrCmpNIW(Name, L"Local\\", 6) == 0 || StrCmpNIW(Name, L"Global\\", 7) == 0)
 	{
-		LPCWSTR Arg = Args[i];
-		LPCWSTR Next = i + 1 < ArgCount ? Args[i + 1] : NULL;
-
-		#define CLI_NEED_VALUE() do { if (!Next) { CliPrint(STD_ERROR_HANDLE, L"error: %ls requires a value\n", Arg); return 1; } i++; } while (0)
-		#define CLI_NUMBER(Var) do { CLI_NEED_VALUE(); if (!CliParseNumber(Next, &(Var)) || (Var) < 0) { CliPrint(STD_ERROR_HANDLE, L"error: invalid value for %ls: %ls\n", Arg, Next); return 1; } } while (0)
-
-		if (StrCmpW(Arg, L"--monitor") == 0)
-		{
-			CLI_NUMBER(MonitorIndex);
-		}
-		else if (StrCmpW(Arg, L"--window") == 0)
-		{
-			CLI_NEED_VALUE();
-			WindowArg = Next;
-		}
-		else if (StrCmpW(Arg, L"--region") == 0)
-		{
-			CLI_NEED_VALUE();
-			if (!CliParseRect(Next, Region) || Region[2] <= 0 || Region[3] <= 0)
-			{
-				CliPrint(STD_ERROR_HANDLE, L"error: --region expects X,Y,W,H with positive W and H\n");
-				return 1;
-			}
-			HasRegion = TRUE;
-		}
-		else if (StrCmpW(Arg, L"-o") == 0 || StrCmpW(Arg, L"--output") == 0)
-		{
-			CLI_NEED_VALUE();
-			Output = Next;
-		}
-		else if (StrCmpW(Arg, L"-d") == 0 || StrCmpW(Arg, L"--duration") == 0)
-		{
-			CLI_NUMBER(Duration);
-		}
-		else if (StrCmpW(Arg, L"--fps") == 0)        CLI_NUMBER(Fps);
-		else if (StrCmpW(Arg, L"--bitrate") == 0)    CLI_NUMBER(Bitrate);
-		else if (StrCmpW(Arg, L"--max-width") == 0)  CLI_NUMBER(MaxWidth);
-		else if (StrCmpW(Arg, L"--max-height") == 0) CLI_NUMBER(MaxHeight);
-		else if (StrCmpW(Arg, L"--audio") == 0)      Audio = 1;
-		else if (StrCmpW(Arg, L"--no-audio") == 0)   Audio = 0;
-		else if (StrCmpW(Arg, L"--no-cursor") == 0)  NoCursor = TRUE;
-		else if (StrCmpW(Arg, L"--no-border") == 0)  NoBorder = TRUE;
-		else if (StrCmpW(Arg, L"--fragmented") == 0) Fragmented = TRUE;
-		else
-		{
-			CliPrint(STD_ERROR_HANDLE, L"error: unknown argument: %ls\n", Arg);
-			return 1;
-		}
-
-		#undef CLI_NUMBER
-		#undef CLI_NEED_VALUE
+		StrCpyNW(Full, Name, (int)Count);
 	}
-
-	if ((MonitorIndex >= 0) + (WindowArg != NULL) + (HasRegion != FALSE) > 1)
+	else
 	{
-		CliPrint(STD_ERROR_HANDLE, L"error: use only one of --monitor, --window or --region\n");
+		StrCpyNW(Full, WCAP_CLI_START_EVENT, (int)Count);
+		StrCatBuffW(Full, Name, (int)Count);
+	}
+}
+
+static int CliSignal(int ArgCount, LPWSTR* Args)
+{
+	if (ArgCount != 1)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: usage: wcap-cli signal NAME\n");
 		return 1;
 	}
 
+	WCHAR Full[300];
+	CliStartEventName(Args[0], Full, _countof(Full));
+	HANDLE Event = OpenEventW(EVENT_MODIFY_STATE, FALSE, Full);
+	if (!Event)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: no recording is waiting for '%ls'\n", Args[0]);
+		return 1;
+	}
+	SetEvent(Event);
+	CloseHandle(Event);
+	CliPrint(STD_OUTPUT_HANDLE, L"signaled: %ls\n", Args[0]);
+	return 0;
+}
+
+//
+// capture target shared by record & snapshot
+//
+
+typedef struct
+{
+	int MonitorIndex; // -1 when not used
+	LPCWSTR WindowArg;
+	BOOL HasRegion;
+	int Region[4];
+	BOOL HasCrop;
+	int Crop[4];
+	LPCWSTR Output;
+	BOOL Json;
+	BOOL NoCursor;
+	BOOL NoBorder;
+}
+CliTarget;
+
+typedef struct
+{
+	HWND Window;
+	HMONITOR Monitor;
+	RECT Rect;
+	BOOL UseRect;
+}
+CliResolved;
+
+#define CLI_NEED_VALUE() do { if (!Next) { CliPrint(STD_ERROR_HANDLE, L"error: %ls requires a value\n", Arg); return -1; } (*Index)++; } while (0)
+
+// returns 1 if argument was handled, 0 if it is not a target option, -1 on error
+static int CliParseTargetOption(CliTarget* Target, int* Index, int ArgCount, LPWSTR* Args)
+{
+	LPCWSTR Arg = Args[*Index];
+	LPCWSTR Next = *Index + 1 < ArgCount ? Args[*Index + 1] : NULL;
+
+	if (StrCmpW(Arg, L"--monitor") == 0)
+	{
+		CLI_NEED_VALUE();
+		if (!CliParseNumber(Next, &Target->MonitorIndex) || Target->MonitorIndex < 0)
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: invalid value for %ls: %ls\n", Arg, Next);
+			return -1;
+		}
+	}
+	else if (StrCmpW(Arg, L"--window") == 0)
+	{
+		CLI_NEED_VALUE();
+		Target->WindowArg = Next;
+	}
+	else if (StrCmpW(Arg, L"--region") == 0)
+	{
+		CLI_NEED_VALUE();
+		if (!CliParseRect(Next, Target->Region) || Target->Region[2] <= 0 || Target->Region[3] <= 0)
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: --region expects X,Y,W,H with positive W and H\n");
+			return -1;
+		}
+		Target->HasRegion = TRUE;
+	}
+	else if (StrCmpW(Arg, L"--crop") == 0)
+	{
+		CLI_NEED_VALUE();
+		if (!CliParseRect(Next, Target->Crop) || Target->Crop[0] < 0 || Target->Crop[1] < 0 || Target->Crop[2] <= 0 || Target->Crop[3] <= 0)
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: --crop expects X,Y,W,H with non-negative X,Y and positive W,H\n");
+			return -1;
+		}
+		Target->HasCrop = TRUE;
+	}
+	else if (StrCmpW(Arg, L"-o") == 0 || StrCmpW(Arg, L"--output") == 0)
+	{
+		CLI_NEED_VALUE();
+		Target->Output = Next;
+	}
+	else if (StrCmpW(Arg, L"--json") == 0)      Target->Json = TRUE;
+	else if (StrCmpW(Arg, L"--no-cursor") == 0) Target->NoCursor = TRUE;
+	else if (StrCmpW(Arg, L"--no-border") == 0) Target->NoBorder = TRUE;
+	else
+	{
+		return 0;
+	}
+	return 1;
+}
+
+// warn about window states where the recording would be empty or not what user expects
+static void CliCheckWindowState(HWND Window)
+{
+	if (IsIconic(Window))
+	{
+		CliWarn(L"window is minimized, the recording will be empty or frozen (restore the window first)");
+		return;
+	}
+
+	BOOL Cloaked = FALSE;
+	if (SUCCEEDED(DwmGetWindowAttribute(Window, DWMWA_CLOAKED, &Cloaked, sizeof(Cloaked))) && Cloaked)
+	{
+		CliWarn(L"window is cloaked (hidden, or on another virtual desktop)");
+		return;
+	}
+
+	RECT Rect;
+	if (FAILED(DwmGetWindowAttribute(Window, DWMWA_EXTENDED_FRAME_BOUNDS, &Rect, sizeof(Rect))))
+	{
+		return;
+	}
+
+	LONG W = Rect.right - Rect.left;
+	LONG H = Rect.bottom - Rect.top;
+	POINT Points[] =
+	{
+		{ Rect.left + W / 2, Rect.top + H / 2 },
+		{ Rect.left + W / 4, Rect.top + H / 4 },
+		{ Rect.left + 3 * W / 4, Rect.top + H / 4 },
+		{ Rect.left + W / 4, Rect.top + 3 * H / 4 },
+		{ Rect.left + 3 * W / 4, Rect.top + 3 * H / 4 },
+	};
+
+	int Covered = 0;
+	for (int i = 0; i < _countof(Points); i++)
+	{
+		HWND Hit = WindowFromPoint(Points[i]);
+		if (Hit && GetAncestor(Hit, GA_ROOTOWNER) != GetAncestor(Window, GA_ROOTOWNER))
+		{
+			Covered++;
+		}
+	}
+	if (Covered == _countof(Points))
+	{
+		CliWarn(L"window is fully covered by other windows");
+	}
+	else if (Covered > 0)
+	{
+		CliWarn(L"window is partially covered by other windows");
+	}
+}
+
+static BOOL CliResolveTarget(const CliTarget* Target, BOOL RoundEven, CliResolved* Result)
+{
+	*Result = (CliResolved){ 0 };
+
+	if ((Target->MonitorIndex >= 0) + (Target->WindowArg != NULL) + (Target->HasRegion != FALSE) > 1)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: use only one of --monitor, --window or --region\n");
+		return FALSE;
+	}
+
+	if (Target->WindowArg)
+	{
+		LPCWSTR WindowArg = Target->WindowArg;
+		HWND Window;
+		int Handle;
+		if (CliIsHandle(WindowArg) && CliParseNumber(WindowArg, &Handle))
+		{
+			Window = (HWND)(ULONG_PTR)(UINT)Handle;
+			if (!IsWindow(Window))
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: window %ls does not exist\n", WindowArg);
+				return FALSE;
+			}
+		}
+		else
+		{
+			CliWindowEnum Enum = { .Title = WindowArg };
+			EnumWindows(&CliWindowProc, (LPARAM)&Enum);
+			if (Enum.Count == 0)
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: no window title contains \"%ls\"\n", WindowArg);
+				return FALSE;
+			}
+			if (Enum.Count > 1)
+			{
+				CliWarn(L"%d windows match \"%ls\", using first one", Enum.Count, WindowArg);
+			}
+			Window = Enum.Result;
+		}
+
+		Window = GetCaptureWindow(Window);
+		if (!Window)
+		{
+			return FALSE;
+		}
+		CliCheckWindowState(Window);
+		Result->Window = Window;
+	}
+	else if (Target->HasRegion)
+	{
+		RECT Rect = { Target->Region[0], Target->Region[1], Target->Region[0] + Target->Region[2], Target->Region[1] + Target->Region[3] };
+		Result->Monitor = MonitorFromRect(&Rect, MONITOR_DEFAULTTONULL);
+		if (!Result->Monitor)
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: region is not on any monitor\n");
+			return FALSE;
+		}
+
+		MONITORINFO Info = { .cbSize = sizeof(Info) };
+		GetMonitorInfoW(Result->Monitor, &Info);
+
+		IntersectRect(&Rect, &Rect, &Info.rcMonitor);
+		OffsetRect(&Rect, -Info.rcMonitor.left, -Info.rcMonitor.top);
+
+		if (RoundEven)
+		{
+			// video encoder needs even sizes
+			Rect.right = Rect.left + ((Rect.right - Rect.left) & ~1);
+			Rect.bottom = Rect.top + ((Rect.bottom - Rect.top) & ~1);
+		}
+		if (IsRectEmpty(&Rect))
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: region is too small\n");
+			return FALSE;
+		}
+
+		Result->Rect = Rect;
+		Result->UseRect = TRUE;
+	}
+	else if (Target->MonitorIndex >= 0)
+	{
+		CliMonitorEnum Enum = { .Wanted = Target->MonitorIndex };
+		EnumDisplayMonitors(NULL, NULL, &CliMonitorProc, (LPARAM)&Enum);
+		if (!Enum.Result)
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: monitor %d does not exist, see 'wcap-cli list'\n", Target->MonitorIndex);
+			return FALSE;
+		}
+		Result->Monitor = Enum.Result;
+	}
+	else
+	{
+		Result->Monitor = MonitorFromPoint((POINT){ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+	}
+	return TRUE;
+}
+
+static void CliSetCrop(const CliTarget* Target, BOOL RoundEven)
+{
+	if (Target->HasCrop)
+	{
+		int W = Target->Crop[2];
+		int H = Target->Crop[3];
+		if (RoundEven)
+		{
+			W = max(2, W & ~1);
+			H = max(2, H & ~1);
+		}
+		gCapture.HasCrop = true;
+		gCapture.Crop = (RECT){ Target->Crop[0], Target->Crop[1], Target->Crop[0] + W, Target->Crop[1] + H };
+	}
+}
+
+static BOOL CliInitConfig(void)
+{
 	if (!ScreenCapture_IsSupported())
 	{
 		CliPrint(STD_ERROR_HANDLE, L"error: Windows 10 Version 1903 or newer is required\n");
-		return 1;
+		return FALSE;
 	}
 
 	GetModuleFileNameW(NULL, gConfigPath, _countof(gConfigPath));
@@ -2042,16 +2451,377 @@ static int CliRecord(int ArgCount, LPWSTR* Args)
 
 	Config_Defaults(&gConfig);
 	Config_Load(&gConfig, gConfigPath);
-
 	gConfig.OpenFolder = FALSE;
-	if (Fps >= 0)       gConfig.VideoMaxFramerate = Fps;
-	if (Bitrate > 0)    gConfig.VideoBitrate = Bitrate;
-	if (MaxWidth >= 0)  gConfig.VideoMaxWidth = MaxWidth;
-	if (MaxHeight >= 0) gConfig.VideoMaxHeight = MaxHeight;
-	if (Audio >= 0)     gConfig.CaptureAudio = Audio;
-	if (NoCursor)       gConfig.MouseCursor = FALSE;
-	if (NoBorder)       gConfig.ShowRecordingBorder = FALSE;
-	if (Fragmented)     gConfig.FragmentedOutput = TRUE;
+	return TRUE;
+}
+
+//
+// waiting for start signal
+//
+
+static BOOL CliWaitStart(void)
+{
+	if (!gCli.StartOn[0])
+	{
+		return TRUE;
+	}
+
+	LPCWSTR Spec = gCli.StartOn;
+	LPCWSTR Name;
+	BOOL IsFile;
+	if (StrCmpNIW(Spec, L"file:", 5) == 0)
+	{
+		IsFile = TRUE;
+		Name = Spec + 5;
+	}
+	else if (StrCmpNIW(Spec, L"event:", 6) == 0)
+	{
+		IsFile = FALSE;
+		Name = Spec + 6;
+	}
+	else
+	{
+		IsFile = StrPBrkW(Spec, L"\\/.:") != NULL;
+		Name = Spec;
+	}
+
+	HANDLE Event = NULL;
+	if (!IsFile)
+	{
+		WCHAR Full[300];
+		CliStartEventName(Name, Full, _countof(Full));
+		Event = CreateEventW(NULL, TRUE, FALSE, Full);
+		if (!Event)
+		{
+			ErrorMessage(L"Cannot create start event!");
+			return FALSE;
+		}
+	}
+
+	CliPrint(gCli.Json ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE, L"waiting: %ls %ls\n", IsFile ? L"file" : L"event", Name);
+
+	ULONGLONG Deadline = gCli.StartTimeoutMs ? GetTickCount64() + gCli.StartTimeoutMs : 0;
+	BOOL Started = FALSE;
+	LPCWSTR Failure = NULL;
+	for (;;)
+	{
+		if (IsFile && GetFileAttributesW(Name) != INVALID_FILE_ATTRIBUTES)
+		{
+			Started = TRUE;
+			break;
+		}
+
+		DWORD Timeout = INFINITE;
+		if (IsFile)
+		{
+			Timeout = 2;
+		}
+		else if (Deadline)
+		{
+			ULONGLONG Now = GetTickCount64();
+			Timeout = Now >= Deadline ? 0 : (DWORD)(Deadline - Now);
+		}
+
+		HANDLE Handles[3] = { gCliAbortEvent, gCliStopEvent, Event };
+		DWORD Wait = WaitForMultipleObjects(Event ? 3 : 2, Handles, FALSE, Timeout);
+		if (Wait == WAIT_OBJECT_0 || Wait == WAIT_OBJECT_0 + 1)
+		{
+			Failure = L"Stopped while waiting for start signal!";
+			break;
+		}
+		if (Wait == WAIT_OBJECT_0 + 2)
+		{
+			Started = TRUE;
+			break;
+		}
+		if (Deadline && GetTickCount64() >= Deadline)
+		{
+			Failure = L"Timed out waiting for start signal!";
+			break;
+		}
+	}
+
+	if (Event)
+	{
+		CloseHandle(Event);
+	}
+	if (!Started)
+	{
+		ErrorMessage(Failure);
+	}
+	else if (gConfig.CaptureAudio)
+	{
+		// audio was captured while waiting, throw it away so recording starts with current audio
+		atomic_store_explicit(&gAudio.BufferRead, atomic_load_explicit(&gAudio.BufferWrite, memory_order_acquire), memory_order_release);
+	}
+	return Started;
+}
+
+//
+// result of recording
+//
+
+static void CliWriteTimestamps(LPCWSTR Path, UINT64 Freq)
+{
+	CliSession* S = &gCli;
+
+	// figure out wall clock time of first frame from current time
+	LARGE_INTEGER NowQpc;
+	QueryPerformanceCounter(&NowQpc);
+	FILETIME NowFile;
+	GetSystemTimePreciseAsFileTime(&NowFile);
+	UINT64 NowTicks = ((UINT64)NowFile.dwHighDateTime << 32) | NowFile.dwLowDateTime;
+	UINT64 StartTicks = NowTicks - (UINT64)MFllMulDiv((LONGLONG)(NowQpc.QuadPart - S->FirstQpc), 10000000, (LONGLONG)Freq, 0);
+
+	FILETIME StartFile = { (DWORD)StartTicks, (DWORD)(StartTicks >> 32) };
+	SYSTEMTIME StartTime;
+	FileTimeToSystemTime(&StartFile, &StartTime);
+
+	CliText Text = { 0 };
+	CliText_Printf(&Text, L"{\"qpc_freq\":%I64u,\"start_qpc\":%I64u,\"start_utc\":\"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\",\"start_unix\":%.6f,",
+		Freq, S->FirstQpc, StartTime.wYear, StartTime.wMonth, StartTime.wDay, StartTime.wHour, StartTime.wMinute, StartTime.wSecond, StartTime.wMilliseconds,
+		(double)(StartTicks - 116444736000000000ULL) / 10000000.0);
+	CliText_Printf(&Text, L"\"width\":%u,\"height\":%u,\"output\":", S->Width, S->Height);
+	CliText_Json(&Text, gRecordingPath);
+	CliText_Printf(&Text, L",\"frames\":[\n");
+	for (size_t i = 0; i < S->LogCount; i++)
+	{
+		const CliFrameLog* F = &S->Log[i];
+		CliText_Printf(&Text, L"%ls{\"i\":%I64u,\"t\":%.6f,\"qpc\":%I64u,\"unique\":%ls,\"diff\":%.4f,\"out\":%d}",
+			i ? L",\n" : L"", (UINT64)i, (double)(F->Qpc - S->FirstQpc) / (double)Freq, F->Qpc,
+			F->Unique ? L"true" : L"false", F->Diff, F->Out);
+	}
+	CliText_Printf(&Text, L"\n]}\n");
+	if (!CliWriteFileUtf8(Path, Text.Data))
+	{
+		CliWarn(L"cannot write %ls", Path);
+	}
+	CliText_Free(&Text);
+}
+
+static void CliReportFinished(void)
+{
+	CliSession* S = &gCli;
+	UINT64 Freq = gTickFreq.QuadPart;
+
+	if (S->FramesOnly)
+	{
+		CliPngQueue_Finish(&S->Png);
+	}
+
+	UINT64 FileSize = 0;
+	if (S->FramesOnly)
+	{
+		FileSize = S->Png.Bytes;
+	}
+	else
+	{
+		WIN32_FILE_ATTRIBUTE_DATA Attributes;
+		if (GetFileAttributesExW(gRecordingPath, GetFileExInfoStandard, &Attributes))
+		{
+			FileSize = ((UINT64)Attributes.nFileSizeHigh << 32) | Attributes.nFileSizeLow;
+		}
+	}
+
+	UINT64 Dropped = gRecordingDroppedFrames + S->Png.Dropped + S->Png.Failed;
+	UINT64 Unique = S->Considered - S->Duplicated;
+	double Duration = S->Considered > 1 ? (double)(S->LastQpc - S->FirstQpc) / (double)Freq : 0;
+	double EffectiveFps = Duration > 0 ? (double)Unique / Duration : 0;
+
+	WCHAR TimestampsPath[MAX_PATH] = L"";
+	if (S->Timestamps)
+	{
+		StrCpyW(TimestampsPath, gRecordingPath);
+		if (S->FramesOnly)
+		{
+			PathAppendW(TimestampsPath, L"frames.json");
+		}
+		else
+		{
+			PathRenameExtensionW(TimestampsPath, L".frames.json");
+		}
+		CliWriteTimestamps(TimestampsPath, Freq);
+	}
+
+	CliText Out = { 0 };
+	if (S->Json)
+	{
+		CliText_Printf(&Out, L"{\"saved\":");
+		CliText_Json(&Out, gRecordingPath);
+		CliText_Printf(&Out, L",\"size_bytes\":%I64u,\"width\":%u,\"height\":%u,\"frames\":%I64u,\"unique_frames\":%I64u,\"duplicated\":%I64u,"
+			L"\"written_frames\":%I64u,\"skipped_fps_limit\":%I64u,\"dropped\":%I64u,\"duration\":%.3f,\"effective_fps\":%.2f",
+			FileSize, S->Width, S->Height, S->Considered, Unique, S->Duplicated,
+			S->OutCount, S->LimitedByFps, Dropped, Duration, EffectiveFps);
+		if (S->FramesOnly)
+		{
+			CliText_Printf(&Out, L",\"frames_dir\":");
+			CliText_Json(&Out, S->FramesDir);
+		}
+		else
+		{
+			// width & height above are size of captured area, video can be smaller with --max-width/--max-height
+			CliText_Printf(&Out, L",\"video_width\":%u,\"video_height\":%u", gEncoder.OutputWidth, gEncoder.OutputHeight);
+		}
+		if (S->Timestamps)
+		{
+			CliText_Printf(&Out, L",\"timestamps\":");
+			CliText_Json(&Out, TimestampsPath);
+		}
+		if (S->MeasureFlicker)
+		{
+			CliText_Printf(&Out, L",\"flicker\":");
+			CliText_Temporal(&Out, &S->Temporal);
+		}
+		CliText_Printf(&Out, L",\"warnings\":");
+		CliText_Warnings(&Out);
+		CliText_Printf(&Out, L"}\n");
+	}
+	else
+	{
+		CliText_Printf(&Out, L"saved: %ls\nsize: %I64u bytes\ndropped_frames: %I64u\n", gRecordingPath, FileSize, Dropped);
+		if (S->Analyze)
+		{
+			CliText_Printf(&Out, L"frames: %I64u\nunique_frames: %I64u\nduplicated_frames: %I64u\nwritten_frames: %I64u\neffective_fps: %.2f\n",
+				S->Considered, Unique, S->Duplicated, S->OutCount, EffectiveFps);
+		}
+		else if (S->FramesOnly)
+		{
+			CliText_Printf(&Out, L"written_frames: %I64u\n", S->OutCount);
+		}
+		if (S->Timestamps)
+		{
+			CliText_Printf(&Out, L"timestamps: %ls\n", TimestampsPath);
+		}
+		if (S->MeasureFlicker)
+		{
+			CliText_Printf(&Out, L"flicker (mean absolute difference between consecutive frames, 0..255):\n");
+			CliText_TemporalHuman(&Out, &S->Temporal);
+		}
+	}
+	CliText_Print(STD_OUTPUT_HANDLE, &Out);
+	CliText_Free(&Out);
+}
+
+//
+// record
+//
+
+static int CliRecord(int ArgCount, LPWSTR* Args)
+{
+	CliTarget Target = { .MonitorIndex = -1 };
+	int Duration = 0;
+
+	// parse arguments first, config values get overridden after loading .ini
+	int Fps = -1, Bitrate = -1, MaxWidth = -1, MaxHeight = -1, Audio = -1;
+	BOOL Fragmented = FALSE, Lossless = FALSE;
+	LPCWSTR FramesDir = NULL;
+	LPCWSTR StartOn = NULL;
+	int StartTimeout = 0;
+
+	for (int i = 0; i < ArgCount; i++)
+	{
+		LPCWSTR Arg = Args[i];
+		LPCWSTR Next = i + 1 < ArgCount ? Args[i + 1] : NULL;
+
+		int Handled = CliParseTargetOption(&Target, &i, ArgCount, Args);
+		if (Handled < 0)
+		{
+			return 1;
+		}
+		if (Handled > 0)
+		{
+			continue;
+		}
+
+		#define CLI_RECORD_VALUE() do { if (!Next) { CliPrint(STD_ERROR_HANDLE, L"error: %ls requires a value\n", Arg); return 1; } i++; } while (0)
+		#define CLI_RECORD_NUMBER(Var) do { CLI_RECORD_VALUE(); if (!CliParseNumber(Next, &(Var)) || (Var) < 0) { CliPrint(STD_ERROR_HANDLE, L"error: invalid value for %ls: %ls\n", Arg, Next); return 1; } } while (0)
+
+		if (StrCmpW(Arg, L"-d") == 0 || StrCmpW(Arg, L"--duration") == 0)
+		{
+			CLI_RECORD_NUMBER(Duration);
+		}
+		else if (StrCmpW(Arg, L"--fps") == 0)
+		{
+			if (Next && StrCmpIW(Next, L"match") == 0)
+			{
+				// only new frames, no framerate limit
+				i++;
+				Fps = 0;
+				gCli.Vfr = TRUE;
+			}
+			else
+			{
+				CLI_RECORD_NUMBER(Fps);
+			}
+		}
+		else if (StrCmpW(Arg, L"--bitrate") == 0)    CLI_RECORD_NUMBER(Bitrate);
+		else if (StrCmpW(Arg, L"--max-width") == 0)  CLI_RECORD_NUMBER(MaxWidth);
+		else if (StrCmpW(Arg, L"--max-height") == 0) CLI_RECORD_NUMBER(MaxHeight);
+		else if (StrCmpW(Arg, L"--audio") == 0)      Audio = 1;
+		else if (StrCmpW(Arg, L"--no-audio") == 0)   Audio = 0;
+		else if (StrCmpW(Arg, L"--fragmented") == 0) Fragmented = TRUE;
+		else if (StrCmpW(Arg, L"--vfr") == 0)        gCli.Vfr = TRUE;
+		else if (StrCmpW(Arg, L"--lossless") == 0)   Lossless = TRUE;
+		else if (StrCmpW(Arg, L"--timestamps") == 0) gCli.Timestamps = TRUE;
+		else if (StrCmpW(Arg, L"--measure-flicker") == 0) gCli.MeasureFlicker = TRUE;
+		else if (StrCmpW(Arg, L"--frames-dir") == 0)
+		{
+			CLI_RECORD_VALUE();
+			FramesDir = Next;
+		}
+		else if (StrCmpW(Arg, L"--start-on") == 0)
+		{
+			CLI_RECORD_VALUE();
+			StartOn = Next;
+		}
+		else if (StrCmpW(Arg, L"--start-timeout") == 0)
+		{
+			CLI_RECORD_NUMBER(StartTimeout);
+		}
+		else if (StrCmpW(Arg, L"--measure-region") == 0)
+		{
+			CLI_RECORD_VALUE();
+			int* Region = gCli.Temporal.Regions[gCli.Temporal.RegionCount < CLI_MAX_REGIONS ? gCli.Temporal.RegionCount : 0];
+			if (gCli.Temporal.RegionCount >= CLI_MAX_REGIONS || !CliParseRect(Next, Region) || Region[2] <= 0 || Region[3] <= 0)
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: --measure-region expects X,Y,W,H with positive W and H (at most %d)\n", CLI_MAX_REGIONS);
+				return 1;
+			}
+			gCli.Temporal.RegionCount++;
+			gCli.MeasureFlicker = TRUE;
+		}
+		else
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: unknown argument: %ls\n", Arg);
+			return 1;
+		}
+
+		#undef CLI_RECORD_NUMBER
+		#undef CLI_RECORD_VALUE
+	}
+
+	if (!CliInitConfig())
+	{
+		return 1;
+	}
+
+	gCli.Json = Target.Json;
+	gCli.Analyze = gCli.Vfr || gCli.Json || gCli.Timestamps || gCli.MeasureFlicker;
+	gCli.Temporal.Keep = gCli.MeasureFlicker;
+	if (StartOn)
+	{
+		StrCpyNW(gCli.StartOn, StartOn, _countof(gCli.StartOn));
+		gCli.StartTimeoutMs = (DWORD)StartTimeout * 1000;
+	}
+
+	if (Fps >= 0)             gConfig.VideoMaxFramerate = Fps;
+	if (Bitrate > 0)          gConfig.VideoBitrate = Bitrate;
+	if (MaxWidth >= 0)        gConfig.VideoMaxWidth = MaxWidth;
+	if (MaxHeight >= 0)       gConfig.VideoMaxHeight = MaxHeight;
+	if (Audio >= 0)           gConfig.CaptureAudio = Audio;
+	if (Target.NoCursor)      gConfig.MouseCursor = FALSE;
+	if (Target.NoBorder)      gConfig.ShowRecordingBorder = FALSE;
+	if (Fragmented)           gConfig.FragmentedOutput = TRUE;
 	if (Duration > 0)
 	{
 		gConfig.EnableLimitLength = TRUE;
@@ -2062,11 +2832,11 @@ static int CliRecord(int ArgCount, LPWSTR* Args)
 		gConfig.EnableLimitLength = FALSE;
 	}
 
-	if (Output)
+	if (Target.Output)
 	{
-		if (!GetFullPathNameW(Output, _countof(gCliOutputPath), gCliOutputPath, NULL))
+		if (!GetFullPathNameW(Target.Output, _countof(gCliOutputPath), gCliOutputPath, NULL))
 		{
-			CliPrint(STD_ERROR_HANDLE, L"error: invalid output path: %ls\n", Output);
+			CliPrint(STD_ERROR_HANDLE, L"error: invalid output path: %ls\n", Target.Output);
 			return 1;
 		}
 		// output folder gets created by StartRecording
@@ -2074,89 +2844,41 @@ static int CliRecord(int ArgCount, LPWSTR* Args)
 		PathRemoveFileSpecW(gConfig.OutputFolder);
 	}
 
-	// resolve capture target
-
-	HWND TargetWindow = NULL;
-	HMONITOR TargetMonitor = NULL;
-	RECT TargetRect;
-	BOOL UseRect = FALSE;
-
-	if (WindowArg)
+	if (Lossless || FramesDir)
 	{
-		int Handle;
-		if (WindowArg[0] == L'0' && (WindowArg[1] == L'x' || WindowArg[1] == L'X') && CliParseNumber(WindowArg, &Handle))
+		gCli.FramesOnly = TRUE;
+		gConfig.CaptureAudio = FALSE;
+		gConfig.EnableLimitSize = FALSE;
+
+		if (FramesDir)
 		{
-			TargetWindow = (HWND)(ULONG_PTR)(UINT)Handle;
-			if (!IsWindow(TargetWindow))
+			if (!GetFullPathNameW(FramesDir, _countof(gCli.FramesDir), gCli.FramesDir, NULL))
 			{
-				CliPrint(STD_ERROR_HANDLE, L"error: window %ls does not exist\n", WindowArg);
+				CliPrint(STD_ERROR_HANDLE, L"error: invalid frames folder: %ls\n", FramesDir);
 				return 1;
 			}
 		}
 		else
 		{
-			CliWindowEnum Enum = { .Title = WindowArg };
-			EnumWindows(&CliWindowProc, (LPARAM)&Enum);
-			if (Enum.Count == 0)
+			if (Target.Output)
 			{
-				CliPrint(STD_ERROR_HANDLE, L"error: no window title contains \"%ls\"\n", WindowArg);
-				return 1;
+				StrCpyW(gCli.FramesDir, gCliOutputPath);
 			}
-			if (Enum.Count > 1)
+			else
 			{
-				CliPrint(STD_ERROR_HANDLE, L"warning: %d windows match \"%ls\", using first one\n", Enum.Count, WindowArg);
+				SYSTEMTIME Time;
+				GetLocalTime(&Time);
+				StrFormat(gCli.FramesDir, L"%ls\\%04u%02u%02u_%02u%02u%02u", gConfig.OutputFolder, Time.wYear, Time.wMonth, Time.wDay, Time.wHour, Time.wMinute, Time.wSecond);
 			}
-			TargetWindow = Enum.Result;
-		}
-
-		TargetWindow = GetCaptureWindow(TargetWindow);
-		if (!TargetWindow)
-		{
-			return 1;
+			PathRemoveExtensionW(gCli.FramesDir);
+			StrCatBuffW(gCli.FramesDir, L"_frames", (int)_countof(gCli.FramesDir));
 		}
 	}
-	else if (HasRegion)
+
+	CliResolved Resolved;
+	if (!CliResolveTarget(&Target, TRUE, &Resolved))
 	{
-		RECT Rect = { Region[0], Region[1], Region[0] + Region[2], Region[1] + Region[3] };
-		TargetMonitor = MonitorFromRect(&Rect, MONITOR_DEFAULTTONULL);
-		if (!TargetMonitor)
-		{
-			CliPrint(STD_ERROR_HANDLE, L"error: region is not on any monitor\n");
-			return 1;
-		}
-
-		MONITORINFO Info = { .cbSize = sizeof(Info) };
-		GetMonitorInfoW(TargetMonitor, &Info);
-
-		IntersectRect(&Rect, &Rect, &Info.rcMonitor);
-		OffsetRect(&Rect, -Info.rcMonitor.left, -Info.rcMonitor.top);
-
-		// video encoder needs even sizes
-		Rect.right = Rect.left + ((Rect.right - Rect.left) & ~1);
-		Rect.bottom = Rect.top + ((Rect.bottom - Rect.top) & ~1);
-		if (IsRectEmpty(&Rect))
-		{
-			CliPrint(STD_ERROR_HANDLE, L"error: region is too small\n");
-			return 1;
-		}
-
-		TargetRect = Rect;
-		UseRect = TRUE;
-	}
-	else if (MonitorIndex >= 0)
-	{
-		CliMonitorEnum Enum = { .Wanted = MonitorIndex };
-		EnumDisplayMonitors(NULL, NULL, &CliMonitorProc, (LPARAM)&Enum);
-		if (!Enum.Result)
-		{
-			CliPrint(STD_ERROR_HANDLE, L"error: monitor %d does not exist, see 'wcap-cli list'\n", MonitorIndex);
-			return 1;
-		}
-		TargetMonitor = Enum.Result;
-	}
-	else
-	{
-		TargetMonitor = MonitorFromPoint((POINT){ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+		return 1;
 	}
 
 	// setup same state as GUI, but with message-only window
@@ -2164,6 +2886,7 @@ static int CliRecord(int ArgCount, LPWSTR* Args)
 	ScreenCapture_Create(&gCapture, &OnCaptureFrame, false);
 	Encoder_Init(&gEncoder);
 	QueryPerformanceFrequency(&gTickFreq);
+	CliSetCrop(&Target, TRUE);
 
 	WNDCLASSEXW WindowClass =
 	{
@@ -2182,19 +2905,20 @@ static int CliRecord(int ArgCount, LPWSTR* Args)
 		return 1;
 	}
 
-	HANDLE StopEvent = CreateEventW(NULL, FALSE, FALSE, WCAP_CLI_STOP_EVENT);
+	gCliStopEvent = CreateEventW(NULL, TRUE, FALSE, WCAP_CLI_STOP_EVENT);
+	gCliAbortEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
 	gCliDoneEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
 	SetConsoleCtrlHandler(&CliCtrlHandler, TRUE);
 
 	// start recording right away
 
-	if (TargetWindow)
+	if (Resolved.Window)
 	{
-		CaptureWindow(TargetWindow);
+		CaptureWindow(Resolved.Window);
 	}
 	else
 	{
-		CaptureMonitor(TargetMonitor, UseRect ? &TargetRect : NULL);
+		CaptureMonitor(Resolved.Monitor, Resolved.UseRect ? &Resolved.Rect : NULL);
 	}
 
 	if (!gRecording)
@@ -2203,9 +2927,17 @@ static int CliRecord(int ArgCount, LPWSTR* Args)
 		return 1;
 	}
 
-	CliPrint(STD_OUTPUT_HANDLE, L"recording: %ls\nvideo: %ux%u @ %.2f fps\n",
-		gRecordingPath, gEncoder.OutputWidth, gEncoder.OutputHeight,
-		(float)gEncoder.FramerateNum / (float)gEncoder.FramerateDen);
+	if (gCli.FramesOnly)
+	{
+		CliPrint(gCli.Json ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE, L"recording: %ls\nframes: %ux%u png sequence\n",
+			gRecordingPath, gCapture.Rect.right - gCapture.Rect.left, gCapture.Rect.bottom - gCapture.Rect.top);
+	}
+	else
+	{
+		CliPrint(gCli.Json ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE, L"recording: %ls\nvideo: %ux%u @ %.2f fps\n",
+			gRecordingPath, gEncoder.OutputWidth, gEncoder.OutputHeight,
+			(float)gEncoder.FramerateNum / (float)gEncoder.FramerateDen);
+	}
 
 	if (Duration > 0)
 	{
@@ -2216,7 +2948,7 @@ static int CliRecord(int ArgCount, LPWSTR* Args)
 	gCliExitCode = 1;
 	for (;;)
 	{
-		DWORD Wait = MsgWaitForMultipleObjects(1, &StopEvent, FALSE, INFINITE, QS_ALLINPUT);
+		DWORD Wait = MsgWaitForMultipleObjects(1, &gCliStopEvent, FALSE, INFINITE, QS_ALLINPUT);
 		if (Wait == WAIT_OBJECT_0 && gRecording)
 		{
 			StopRecording();
@@ -2236,6 +2968,627 @@ static int CliRecord(int ArgCount, LPWSTR* Args)
 	}
 }
 
+//
+// snapshot
+//
+
+static struct
+{
+	WCHAR Path[MAX_PATH];
+	CliReadback Readback;
+	BOOL Done;
+	BOOL Ok;
+	UINT Width;
+	UINT Height;
+}
+gSnap;
+
+static bool CliSnapshotFrame(ScreenCapture* Capture, ScreenCaptureFrame* Frame)
+{
+	if (Frame == NULL)
+	{
+		// captured item was closed
+		gSnap.Done = TRUE;
+		PostQuitMessage(0);
+		return true;
+	}
+	if (gSnap.Done)
+	{
+		return true;
+	}
+
+	const BYTE* Data;
+	UINT Pitch, W, H;
+	if (CliReadback_Map(&gSnap.Readback, Frame->Texture, Frame->Rect, &Data, &Pitch, &W, &H))
+	{
+		gSnap.Ok = CliPng_WriteSync(gSnap.Path, W, H, Data, Pitch);
+		gSnap.Width = W;
+		gSnap.Height = H;
+		CliReadback_Unmap(&gSnap.Readback);
+		gSnap.Done = TRUE;
+		PostQuitMessage(0);
+	}
+	return true;
+}
+
+static int CliSnapshot(int ArgCount, LPWSTR* Args)
+{
+	CliTarget Target = { .MonitorIndex = -1 };
+	for (int i = 0; i < ArgCount; i++)
+	{
+		int Handled = CliParseTargetOption(&Target, &i, ArgCount, Args);
+		if (Handled < 0)
+		{
+			return 1;
+		}
+		if (Handled == 0)
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: unknown argument: %ls\n", Args[i]);
+			return 1;
+		}
+	}
+
+	if (!CliInitConfig())
+	{
+		return 1;
+	}
+	if (Target.NoCursor) gConfig.MouseCursor = FALSE;
+	if (Target.NoBorder) gConfig.ShowRecordingBorder = FALSE;
+
+	if (Target.Output)
+	{
+		if (!GetFullPathNameW(Target.Output, _countof(gSnap.Path), gSnap.Path, NULL))
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: invalid output path: %ls\n", Target.Output);
+			return 1;
+		}
+	}
+	else
+	{
+		SYSTEMTIME Time;
+		GetLocalTime(&Time);
+		StrFormat(gSnap.Path, L"%ls\\%04u%02u%02u_%02u%02u%02u.png", gConfig.OutputFolder, Time.wYear, Time.wMonth, Time.wDay, Time.wHour, Time.wMinute, Time.wSecond);
+	}
+	WCHAR Folder[MAX_PATH];
+	StrCpyW(Folder, gSnap.Path);
+	PathRemoveFileSpecW(Folder);
+	SHCreateDirectoryExW(NULL, Folder, NULL);
+
+	CliResolved Resolved;
+	if (!CliResolveTarget(&Target, FALSE, &Resolved))
+	{
+		return 1;
+	}
+
+	ScreenCapture_Create(&gCapture, &CliSnapshotFrame, false);
+	CliSetCrop(&Target, FALSE);
+
+	ID3D11Device* Device = CreateDevice();
+	if (!Device)
+	{
+		return 1;
+	}
+
+	bool Created;
+	if (Resolved.Window)
+	{
+		Created = ScreenCapture_CreateForWindow(&gCapture, Device, Resolved.Window, gConfig.OnlyClientArea, !gConfig.KeepRoundedWindowCorners);
+	}
+	else
+	{
+		Created = ScreenCapture_CreateForMonitor(&gCapture, Device, Resolved.Monitor, Resolved.UseRect ? &Resolved.Rect : NULL);
+	}
+	if (!Created)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: cannot capture selected target\n");
+		return 1;
+	}
+	if (IsRectEmpty(&gCapture.Rect))
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: capture area is empty (window minimized, or crop is outside of captured area)\n");
+		ScreenCapture_Stop(&gCapture);
+		return 1;
+	}
+
+	ScreenCapture_Start(&gCapture, gConfig.MouseCursor, gConfig.ShowRecordingBorder, gConfig.IncludeSecondaryWindows);
+
+	// wait for first frame
+	ULONGLONG Deadline = GetTickCount64() + 5000;
+	while (!gSnap.Done)
+	{
+		ULONGLONG Now = GetTickCount64();
+		if (Now >= Deadline)
+		{
+			break;
+		}
+		MsgWaitForMultipleObjects(0, NULL, FALSE, (DWORD)(Deadline - Now), QS_ALLINPUT);
+
+		MSG Message;
+		while (PeekMessageW(&Message, NULL, 0, 0, PM_REMOVE))
+		{
+			if (Message.message == WM_QUIT)
+			{
+				break;
+			}
+			TranslateMessage(&Message);
+			DispatchMessageW(&Message);
+		}
+	}
+
+	ScreenCapture_Stop(&gCapture);
+	CliReadback_Release(&gSnap.Readback);
+	ID3D11Device_Release(Device);
+
+	if (!gSnap.Done || !gSnap.Ok)
+	{
+		CliPrint(STD_ERROR_HANDLE, gSnap.Done ? L"error: cannot write %ls\n" : L"error: no frame was captured within 5 seconds\n", gSnap.Path);
+		return 1;
+	}
+
+	UINT64 FileSize = 0;
+	WIN32_FILE_ATTRIBUTE_DATA Attributes;
+	if (GetFileAttributesExW(gSnap.Path, GetFileExInfoStandard, &Attributes))
+	{
+		FileSize = ((UINT64)Attributes.nFileSizeHigh << 32) | Attributes.nFileSizeLow;
+	}
+
+	if (Target.Json)
+	{
+		CliText Out = { 0 };
+		CliText_Printf(&Out, L"{\"saved\":");
+		CliText_Json(&Out, gSnap.Path);
+		CliText_Printf(&Out, L",\"width\":%u,\"height\":%u,\"size_bytes\":%I64u,\"warnings\":", gSnap.Width, gSnap.Height, FileSize);
+		CliText_Warnings(&Out);
+		CliText_Printf(&Out, L"}\n");
+		CliText_Print(STD_OUTPUT_HANDLE, &Out);
+	}
+	else
+	{
+		CliPrint(STD_OUTPUT_HANDLE, L"saved: %ls\nimage: %ux%u\nsize: %I64u bytes\n", gSnap.Path, gSnap.Width, gSnap.Height, FileSize);
+	}
+	return 0;
+}
+
+//
+// diff & sheet work on mp4 files
+//
+
+static BOOL CliStartMediaFoundation(void)
+{
+	HR(CoInitializeEx(0, COINIT_APARTMENTTHREADED));
+	if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_FULL)))
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: cannot initialize Media Foundation\n");
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static void CliFullPath(LPCWSTR Path, WCHAR* Full, DWORD Count)
+{
+	if (!GetFullPathNameW(Path, Count, Full, NULL))
+	{
+		StrCpyNW(Full, Path, Count);
+	}
+}
+
+static void CliText_RegionStats(CliText* Out, const int Regions[][4], const CliDoubles* Values, int Count)
+{
+	for (int r = 0; r < Count; r++)
+	{
+		CliDiffStats Stats = CliDiffStats_Compute(&Values[r]);
+		CliText_Printf(Out, L"%ls{\"rect\":[%d,%d,%d,%d],", r ? L"," : L"", Regions[r][0], Regions[r][1], Regions[r][2], Regions[r][3]);
+		CliText_Stats(Out, &Stats);
+		CliText_Char(Out, L'}');
+	}
+}
+
+static int CliDiff(int ArgCount, LPWSTR* Args)
+{
+	LPCWSTR Clips[2] = { 0 };
+	int ClipCount = 0;
+	int Regions[CLI_MAX_REGIONS][4];
+	int RegionCount = 0;
+	BOOL Json = FALSE;
+
+	for (int i = 0; i < ArgCount; i++)
+	{
+		LPCWSTR Arg = Args[i];
+		if (StrCmpW(Arg, L"--json") == 0)
+		{
+			Json = TRUE;
+		}
+		else if (StrCmpW(Arg, L"--region") == 0)
+		{
+			if (i + 1 >= ArgCount || RegionCount >= CLI_MAX_REGIONS || !CliParseRect(Args[i + 1], Regions[RegionCount]) || Regions[RegionCount][2] <= 0 || Regions[RegionCount][3] <= 0)
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: --region expects X,Y,W,H with positive W and H (at most %d)\n", CLI_MAX_REGIONS);
+				return 1;
+			}
+			RegionCount++;
+			i++;
+		}
+		else if (Arg[0] == L'-' && Arg[1])
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: unknown argument: %ls\n", Arg);
+			return 1;
+		}
+		else if (ClipCount < 2)
+		{
+			Clips[ClipCount++] = Arg;
+		}
+		else
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: diff takes at most two clips\n");
+			return 1;
+		}
+	}
+	if (ClipCount == 0)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: usage: wcap-cli diff A.mp4 [B.mp4] [--region X,Y,W,H]... [--json]\n");
+		return 1;
+	}
+
+	if (!CliStartMediaFoundation())
+	{
+		return 1;
+	}
+
+	CliClip Clip[2] = { 0 };
+	CliTemporal Temporal[2] = { 0 };
+	WCHAR Paths[2][MAX_PATH];
+	for (int c = 0; c < ClipCount; c++)
+	{
+		CliFullPath(Clips[c], Paths[c], MAX_PATH);
+		if (!CliClip_Open(&Clip[c], Paths[c]))
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: cannot open video: %ls\n", Paths[c]);
+			return 1;
+		}
+		Temporal[c].Keep = TRUE;
+		Temporal[c].RegionCount = RegionCount;
+		CopyMemory(Temporal[c].Regions, Regions, sizeof(Regions));
+	}
+
+	// difference between frame N of A and frame N of B, only when sizes match
+	BOOL Spatial = ClipCount == 2 && Clip[0].Width == Clip[1].Width && Clip[0].Height == Clip[1].Height;
+	CliDoubles SpatialWhole = { 0 };
+	CliDoubles SpatialRegion[CLI_MAX_REGIONS] = { 0 };
+
+	for (;;)
+	{
+		BOOL Have[2] = { 0 };
+		for (int c = 0; c < ClipCount; c++)
+		{
+			Have[c] = CliClip_Next(&Clip[c]);
+			if (Have[c])
+			{
+				double Diff;
+				CliTemporal_Add(&Temporal[c], Clip[c].Pixels, (size_t)Clip[c].Width * 4, Clip[c].Width, Clip[c].Height, &Diff);
+			}
+		}
+		if (!Have[0] && !Have[1])
+		{
+			break;
+		}
+		if (Spatial && Have[0] && Have[1])
+		{
+			UINT W = Clip[0].Width, H = Clip[0].Height;
+			UINT64 Sad = CliSad(Clip[0].Pixels, (size_t)W * 4, Clip[1].Pixels, (size_t)W * 4, 0, 0, (int)W, (int)H);
+			CliDoubles_Add(&SpatialWhole, CliMeanDiff(Sad, (int)W, (int)H));
+			for (int r = 0; r < RegionCount; r++)
+			{
+				int Rect[4];
+				if (CliClipRegion(Regions[r], (int)W, (int)H, Rect))
+				{
+					UINT64 RegionSad = CliSad(Clip[0].Pixels, (size_t)W * 4, Clip[1].Pixels, (size_t)W * 4, Rect[0], Rect[1], Rect[2], Rect[3]);
+					CliDoubles_Add(&SpatialRegion[r], CliMeanDiff(RegionSad, Rect[2], Rect[3]));
+				}
+			}
+		}
+	}
+
+	CliText Out = { 0 };
+	if (Json)
+	{
+		CliText_Char(&Out, L'{');
+		for (int c = 0; c < ClipCount; c++)
+		{
+			CliText_Printf(&Out, L"%ls\"%ls\":{\"path\":", c ? L"," : L"", c ? L"b" : L"a");
+			CliText_Json(&Out, Paths[c]);
+			CliText_Printf(&Out, L",\"width\":%u,\"height\":%u,\"duration\":%.3f,\"temporal\":", Clip[c].Width, Clip[c].Height, (double)Clip[c].DurationHns / 10000000.0);
+			CliText_Temporal(&Out, &Temporal[c]);
+			CliText_Char(&Out, L'}');
+		}
+		if (ClipCount == 2)
+		{
+			CliText_Printf(&Out, L",\"spatial\":");
+			if (Spatial)
+			{
+				CliDiffStats Whole = CliDiffStats_Compute(&SpatialWhole);
+				CliText_Printf(&Out, L"{\"frames\":%I64u,\"whole\":{", (UINT64)SpatialWhole.Count);
+				CliText_Stats(&Out, &Whole);
+				CliText_Printf(&Out, L"},\"regions\":[");
+				CliText_RegionStats(&Out, Regions, SpatialRegion, RegionCount);
+				CliText_Printf(&Out, L"]}");
+			}
+			else
+			{
+				CliText_Printf(&Out, L"null");
+			}
+
+			// temporal comparison of A and B, region -1 is whole frame
+			CliText_Printf(&Out, L",\"comparison\":[");
+			for (int r = 0; r <= RegionCount; r++)
+			{
+				CliDiffStats SA = CliDiffStats_Compute(r ? &Temporal[0].PerRegion[r - 1] : &Temporal[0].Whole);
+				CliDiffStats SB = CliDiffStats_Compute(r ? &Temporal[1].PerRegion[r - 1] : &Temporal[1].Whole);
+				CliText_Printf(&Out, L"%ls{\"region\":%d,\"mean_a\":%.5f,\"mean_b\":%.5f,\"mean_nonzero_a\":%.5f,\"mean_nonzero_b\":%.5f,\"ratio_mean\":",
+					r ? L"," : L"", r - 1, SA.Mean, SB.Mean, SA.MeanNonZero, SB.MeanNonZero);
+				if (SA.Mean > 0) CliText_Printf(&Out, L"%.4f", SB.Mean / SA.Mean); else CliText_Printf(&Out, L"null");
+				CliText_Char(&Out, L'}');
+			}
+			CliText_Char(&Out, L']');
+		}
+		CliText_Printf(&Out, L"}\n");
+	}
+	else
+	{
+		for (int c = 0; c < ClipCount; c++)
+		{
+			CliText_Printf(&Out, L"%ls: %ls %ux%u %.3fs\n", c ? L"B" : L"A", Paths[c], Clip[c].Width, Clip[c].Height, (double)Clip[c].DurationHns / 10000000.0);
+			CliText_Printf(&Out, L"temporal difference between consecutive frames (mean absolute difference per channel, 0..255)\n");
+			CliText_TemporalHuman(&Out, &Temporal[c]);
+		}
+		if (ClipCount == 2)
+		{
+			if (Spatial)
+			{
+				CliText_Printf(&Out, L"A vs B, same frame index (%I64u frames):\n", (UINT64)SpatialWhole.Count);
+				CliText_StatsLine(&Out, L"whole      ", &SpatialWhole);
+				for (int r = 0; r < RegionCount; r++)
+				{
+					WCHAR Label[64];
+					StrFormat(Label, L"region %d [%d,%d,%d,%d]", r, Regions[r][0], Regions[r][1], Regions[r][2], Regions[r][3]);
+					CliText_StatsLine(&Out, Label, &SpatialRegion[r]);
+				}
+			}
+			else
+			{
+				CliText_Printf(&Out, L"A vs B: skipped, videos have different sizes\n");
+			}
+			CliText_Printf(&Out, L"temporal mean B / A:\n");
+			for (int r = 0; r <= RegionCount; r++)
+			{
+				CliDiffStats SA = CliDiffStats_Compute(r ? &Temporal[0].PerRegion[r - 1] : &Temporal[0].Whole);
+				CliDiffStats SB = CliDiffStats_Compute(r ? &Temporal[1].PerRegion[r - 1] : &Temporal[1].Whole);
+				CliText_Printf(&Out, L"  %ls %d: A=%.4f B=%.4f ratio=", r ? L"region" : L"whole", r ? r - 1 : 0, SA.Mean, SB.Mean);
+				if (SA.Mean > 0) CliText_Printf(&Out, L"%.3f\n", SB.Mean / SA.Mean); else CliText_Printf(&Out, L"n/a\n");
+			}
+		}
+	}
+	CliText_Print(STD_OUTPUT_HANDLE, &Out);
+	return 0;
+}
+
+static int CliSheet(int ArgCount, LPWSTR* Args)
+{
+	CliSheetInput Inputs[8] = { 0 };
+	int InputCount = 0;
+	double Times[64];
+	int TimeCount = 0;
+	double Every = 0;
+	int Count = 0;
+	CliSheetOptions Options = { .Labels = TRUE, .CellWidth = 640 };
+	LPCWSTR Output = NULL;
+	BOOL Json = FALSE;
+
+	for (int i = 0; i < ArgCount; i++)
+	{
+		LPCWSTR Arg = Args[i];
+		LPCWSTR Next = i + 1 < ArgCount ? Args[i + 1] : NULL;
+
+		if (StrCmpW(Arg, L"--json") == 0)            Json = TRUE;
+		else if (StrCmpW(Arg, L"--grid") == 0)       Options.Grid = TRUE;
+		else if (StrCmpW(Arg, L"--no-labels") == 0)  Options.Labels = FALSE;
+		else if (Arg[0] == L'-' && Arg[1] && !Next)
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: %ls requires a value\n", Arg);
+			return 1;
+		}
+		else if (StrCmpW(Arg, L"-o") == 0 || StrCmpW(Arg, L"--output") == 0)
+		{
+			Output = Next;
+			i++;
+		}
+		else if (StrCmpW(Arg, L"--at") == 0)
+		{
+			LPCWSTR p = Next;
+			for (;;)
+			{
+				double Time;
+				if (TimeCount >= (int)_countof(Times) || !CliParseDouble(p, &Time, &p))
+				{
+					CliPrint(STD_ERROR_HANDLE, L"error: --at expects comma separated times in seconds (at most %d)\n", (int)_countof(Times));
+					return 1;
+				}
+				Times[TimeCount++] = Time;
+				if (*p != L',')
+				{
+					break;
+				}
+				p++;
+			}
+			if (*p)
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: invalid --at value: %ls\n", Next);
+				return 1;
+			}
+			i++;
+		}
+		else if (StrCmpW(Arg, L"--every") == 0)
+		{
+			LPCWSTR End;
+			if (!CliParseDouble(Next, &Every, &End) || *End || Every <= 0)
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: invalid --every value: %ls\n", Next);
+				return 1;
+			}
+			i++;
+		}
+		else if (StrCmpW(Arg, L"--count") == 0)
+		{
+			if (!CliParseNumber(Next, &Count) || Count <= 0 || Count > (int)_countof(Times))
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: invalid --count value: %ls\n", Next);
+				return 1;
+			}
+			i++;
+		}
+		else if (StrCmpW(Arg, L"--cols") == 0)
+		{
+			if (!CliParseNumber(Next, &Options.Columns) || Options.Columns <= 0)
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: invalid --cols value: %ls\n", Next);
+				return 1;
+			}
+			i++;
+		}
+		else if (StrCmpW(Arg, L"--width") == 0)
+		{
+			if (!CliParseNumber(Next, &Options.CellWidth) || Options.CellWidth < 0 || Options.CellWidth > 16384)
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: invalid --width value: %ls\n", Next);
+				return 1;
+			}
+			i++;
+		}
+		else if (StrCmpW(Arg, L"--region") == 0)
+		{
+			if (!CliParseRect(Next, Options.Region) || Options.Region[2] <= 0 || Options.Region[3] <= 0)
+			{
+				CliPrint(STD_ERROR_HANDLE, L"error: --region expects X,Y,W,H with positive W and H\n");
+				return 1;
+			}
+			i++;
+		}
+		else if (Arg[0] == L'-' && Arg[1])
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: unknown argument: %ls\n", Arg);
+			return 1;
+		}
+		else if (InputCount < (int)_countof(Inputs))
+		{
+			Inputs[InputCount++].Path = Arg;
+		}
+		else
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: too many input videos\n");
+			return 1;
+		}
+	}
+	if (InputCount == 0)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: usage: wcap-cli sheet CLIP.mp4... [--at T,T,...] [-o sheet.png]\n");
+		return 1;
+	}
+
+	if (!CliStartMediaFoundation())
+	{
+		return 1;
+	}
+
+	WCHAR Paths[8][MAX_PATH];
+	for (int c = 0; c < InputCount; c++)
+	{
+		CliFullPath(Inputs[c].Path, Paths[c], MAX_PATH);
+		Inputs[c].Path = Paths[c];
+		if (!CliClip_Open(&Inputs[c].Clip, Paths[c]))
+		{
+			CliPrint(STD_ERROR_HANDLE, L"error: cannot open video: %ls\n", Paths[c]);
+			return 1;
+		}
+	}
+
+	// times relative to duration of first clip when not given explicitly
+	if (TimeCount == 0)
+	{
+		double Duration = (double)Inputs[0].Clip.DurationHns / 10000000.0;
+		if (Every > 0)
+		{
+			for (double t = 0; t < Duration && TimeCount < (int)_countof(Times); t += Every)
+			{
+				Times[TimeCount++] = t;
+			}
+		}
+		else
+		{
+			int N = Count ? Count : 6;
+			for (int i = 0; i < N; i++)
+			{
+				Times[TimeCount++] = Duration * (i + 0.5) / N;
+			}
+		}
+	}
+	if (TimeCount == 0)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: no frame times to extract\n");
+		return 1;
+	}
+	if (InputCount * TimeCount > 64)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: at most 64 frames per sheet\n");
+		return 1;
+	}
+
+	WCHAR OutputPath[MAX_PATH];
+	if (Output)
+	{
+		CliFullPath(Output, OutputPath, MAX_PATH);
+	}
+	else
+	{
+		StrCpyW(OutputPath, Paths[0]);
+		PathRenameExtensionW(OutputPath, L".sheet.png");
+	}
+	WCHAR Folder[MAX_PATH];
+	StrCpyW(Folder, OutputPath);
+	PathRemoveFileSpecW(Folder);
+	SHCreateDirectoryExW(NULL, Folder, NULL);
+
+	Options.Inputs = Inputs;
+	Options.InputCount = InputCount;
+	Options.Times = Times;
+	Options.TimeCount = TimeCount;
+
+	UINT Width, Height;
+	LPCWSTR Error = CliSheet_Render(&Options, OutputPath, &Width, &Height);
+	if (Error)
+	{
+		CliPrint(STD_ERROR_HANDLE, L"error: %ls\n", Error);
+		return 1;
+	}
+
+	if (Json)
+	{
+		CliText Out = { 0 };
+		CliText_Printf(&Out, L"{\"saved\":");
+		CliText_Json(&Out, OutputPath);
+		CliText_Printf(&Out, L",\"width\":%u,\"height\":%u,\"clips\":%d,\"times\":[", Width, Height, InputCount);
+		for (int i = 0; i < TimeCount; i++)
+		{
+			CliText_Printf(&Out, L"%ls%.3f", i ? L"," : L"", Times[i]);
+		}
+		CliText_Printf(&Out, L"]}\n");
+		CliText_Print(STD_OUTPUT_HANDLE, &Out);
+	}
+	else
+	{
+		CliPrint(STD_OUTPUT_HANDLE, L"saved: %ls\nimage: %ux%u\nframes: %d\n", OutputPath, Width, Height, InputCount * TimeCount);
+	}
+	return 0;
+}
+
 static int CliMain(int ArgCount, LPWSTR* Args)
 {
 	if (ArgCount < 2 || StrCmpW(Args[1], L"help") == 0 || StrCmpW(Args[1], L"--help") == 0 || StrCmpW(Args[1], L"-h") == 0)
@@ -2245,15 +3598,31 @@ static int CliMain(int ArgCount, LPWSTR* Args)
 	}
 	if (StrCmpW(Args[1], L"list") == 0)
 	{
-		return CliList();
+		return CliList(ArgCount - 2, Args + 2);
 	}
 	if (StrCmpW(Args[1], L"stop") == 0)
 	{
 		return CliStop();
 	}
+	if (StrCmpW(Args[1], L"signal") == 0)
+	{
+		return CliSignal(ArgCount - 2, Args + 2);
+	}
 	if (StrCmpW(Args[1], L"record") == 0)
 	{
 		return CliRecord(ArgCount - 2, Args + 2);
+	}
+	if (StrCmpW(Args[1], L"snapshot") == 0)
+	{
+		return CliSnapshot(ArgCount - 2, Args + 2);
+	}
+	if (StrCmpW(Args[1], L"diff") == 0)
+	{
+		return CliDiff(ArgCount - 2, Args + 2);
+	}
+	if (StrCmpW(Args[1], L"sheet") == 0)
+	{
+		return CliSheet(ArgCount - 2, Args + 2);
 	}
 
 	CliPrint(STD_ERROR_HANDLE, L"error: unknown command: %ls, see 'wcap-cli help'\n", Args[1]);

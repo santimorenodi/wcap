@@ -39,21 +39,45 @@ Command line (wcap-cli)
 `build.cmd` also produces `wcap-cli-x64.exe`, a console version that records immediately (no countdown, no tray icon,
 no hotkeys) and is meant for scripts & automation. It can run next to the tray version.
 
-    wcap-cli list                                   list monitors (with index) and capturable windows (with handle)
+    wcap-cli list [--json] [--filter TEXT]          list monitors (with index) and capturable windows (with handle)
     wcap-cli record [target] [options]              record until --duration expires, Ctrl+C or "wcap-cli stop"
     wcap-cli stop                                   stop all running "wcap-cli record" processes
+    wcap-cli signal NAME                            release a "record --start-on NAME" that is waiting
+    wcap-cli snapshot [target] -o FILE.png          save a single frame as png
+    wcap-cli diff A.mp4 [B.mp4] [--region R]...     frame to frame difference of clips, in numbers
+    wcap-cli sheet CLIP.mp4... [--at T,T,...]       contact sheet png with frames at given times
 
     target:   --monitor N | --window 0xHANDLE | --window "title substring" | --region X,Y,W,H   (default: primary monitor)
+              --crop X,Y,W,H     crop relative to top-left of the captured window (or monitor/region), stays valid if window moves
     options:  -o FILE.mp4, -d SECONDS, --fps N, --bitrate KBPS, --max-width N, --max-height N,
               --audio, --no-audio, --no-cursor, --no-border, --fragmented
+
+Options for analysis & automation (`record`):
+
+    --fps match | --vfr    only new frames: frames identical to the previous one are not written (variable framerate)
+    --json                 result as one JSON object, with frames, unique_frames, duplicated, effective_fps, dropped
+    --timestamps           writes CLIP.frames.json with capture time (QPC ticks + seconds) of every frame
+    --measure-flicker      mean absolute difference between consecutive captured frames (uncompressed), whole frame
+    --measure-region R     same for region X,Y,W,H of recorded frame, can be repeated
+    --lossless             png sequence in NAME_frames folder instead of mp4 (no compression noise)
+    --frames-dir DIR       png sequence in given folder
+    --start-on SPEC        prepare everything, start capturing when SPEC fires: event:NAME (see "signal") or file:PATH
+    --start-timeout SEC    stop waiting for --start-on after SEC seconds
+
+Window state (minimized, covered, on other virtual desktop) is checked when recording a window and reported
+as `warning:` lines on stderr (and in the `warnings` array of JSON output).
 
 Examples:
 
     wcap-cli record --monitor 1 -d 10 -o demo.mp4
     wcap-cli record --window "Chrome" --no-audio -d 5 -o chrome.mp4
     wcap-cli record --region 100,100,1280,720 -o region.mp4     (then later: wcap-cli stop)
+    wcap-cli record --window 0x20b0c --crop 8,40,1280,720 --vfr --json --measure-flicker -d 10 -o game.mp4
+    wcap-cli diff before.mp4 after.mp4 --region 0,0,400,300
+    wcap-cli sheet before.mp4 after.mp4 --at 0.6,3.0 -o compare.png
 
 It prints `recording: PATH` when started and `saved: PATH` with file size when finished, exit code is 0 on success.
+With `--json` the only thing on stdout is the final JSON object.
 Other settings are read from `wcap-cli-x64.ini` next to the exe (same keys as the tray version).
 
 Claude Code plugin
