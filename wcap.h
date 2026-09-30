@@ -45,12 +45,17 @@
 // writes UTF-8 text to console/pipe handle (STD_OUTPUT_HANDLE or STD_ERROR_HANDLE)
 static void WriteText(DWORD StdHandle, LPCWSTR Text)
 {
-	char Buffer[4096];
-	int Length = WideCharToMultiByte(CP_UTF8, 0, Text, -1, Buffer, sizeof(Buffer), NULL, NULL);
+	int Length = WideCharToMultiByte(CP_UTF8, 0, Text, -1, NULL, 0, NULL, NULL);
 	if (Length > 1)
 	{
-		DWORD Written;
-		WriteFile(GetStdHandle(StdHandle), Buffer, Length - 1, &Written, NULL);
+		char* Buffer = HeapAlloc(GetProcessHeap(), 0, Length);
+		if (Buffer)
+		{
+			WideCharToMultiByte(CP_UTF8, 0, Text, -1, Buffer, Length, NULL, NULL);
+			DWORD Written;
+			WriteFile(GetStdHandle(StdHandle), Buffer, Length - 1, &Written, NULL);
+			HeapFree(GetProcessHeap(), 0, Buffer);
+		}
 	}
 }
 

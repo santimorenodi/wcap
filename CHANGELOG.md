@@ -1,6 +1,16 @@
 Changelog
 =========
 
+##### unreleased
+ * wcap-cli: `--fps match` / `--vfr` to skip frames identical to the previous one
+ * wcap-cli: `--crop X,Y,W,H` relative to captured window/monitor/region
+ * wcap-cli: warnings when captured window is minimized, cloaked or covered
+ * wcap-cli: `--lossless` / `--frames-dir` write png sequence instead of mp4
+ * wcap-cli: `--start-on event:NAME|file:PATH`, `wcap-cli signal NAME`
+ * wcap-cli: `--json` for `record` and `list`, `list --filter`
+ * wcap-cli: `--timestamps` writes capture time of every frame to `.frames.json`
+ * wcap-cli: `snapshot`, `diff`, `sheet` commands, `--measure-flicker` / `--measure-region`
+
 ##### 2025.11.23
  * option to capture secondary windows (popups & dialogs) on Windows 11 24H2 and up
 

@@ -54,6 +54,11 @@ typedef struct ScreenCapture
 	HWND Window;
 	bool OnlyClientArea;
 
+	// optional crop of captured area, set before calling ScreenCapture_CreateFor*
+	// coordinates are relative to top-left of captured window/monitor/region
+	bool HasCrop;
+	RECT Crop;
+
 	bool RestoreWindowCornerPreference;
 	DWM_WINDOW_CORNER_PREFERENCE WindowCornerPreference;
 }
@@ -261,6 +266,25 @@ static __FITypedEventHandler_2_Windows__CGraphics__CCapture__CGraphicsCaptureIte
 	.Invoke         = ScreenCapture__CloseInvoke,
 };
 
+static RECT ScreenCapture__ApplyCrop(const ScreenCapture* Capture, RECT Base)
+{
+	if (!Capture->HasCrop)
+	{
+		return Base;
+	}
+
+	RECT Cropped =
+	{
+		.left   = Base.left + Capture->Crop.left,
+		.top    = Base.top + Capture->Crop.top,
+		.right  = Base.left + Capture->Crop.right,
+		.bottom = Base.top + Capture->Crop.bottom,
+	};
+	// empty rectangle when there is no overlap
+	IntersectRect(&Cropped, &Cropped, &Base);
+	return Cropped;
+}
+
 static RECT ScreenCapture__GetRect(ScreenCapture* Capture, uint32_t Width, uint32_t Height)
 {
 	if (Capture->Window) // capturing window
@@ -284,20 +308,20 @@ static RECT ScreenCapture__GetRect(ScreenCapture* Capture, uint32_t Width, uint3
 			Rect.top = max(0, TopLeft.y - WindowRect.top);
 			Rect.right = Rect.left + min((uint32_t)ClientRect.right, Width - Rect.left);
 			Rect.bottom = Rect.top + min((uint32_t)ClientRect.bottom, Height - Rect.top);
-			return Rect;
+			return ScreenCapture__ApplyCrop(Capture, Rect);
 		}
 		else // whole window size
 		{
-			return (RECT)
+			return ScreenCapture__ApplyCrop(Capture, (RECT)
 			{
 				.left = 0,
 				.top = 0,
 				.right = WindowRect.right - WindowRect.left,
 				.bottom = WindowRect.bottom - WindowRect.top,
-			};
+			});
 		}
 	}
-	else // capturing monitor, or region on it
+	else // capturing monitor, or region on it, crop was already applied
 	{
 		return Capture->Rect;
 	}
@@ -496,7 +520,7 @@ bool ScreenCapture_CreateForMonitor(ScreenCapture* Capture, ID3D11Device* Device
 			Capture->FramePool = FramePool;
 			Capture->Window = NULL;
 			Capture->CurrentSize = Size;
-			Capture->Rect = Rect ? *Rect : (RECT) { 0, 0, Size.Width, Size.Height };
+			Capture->Rect = ScreenCapture__ApplyCrop(Capture, Rect ? *Rect : (RECT) { 0, 0, Size.Width, Size.Height });
 
 			Capture->RestoreWindowCornerPreference = false;
 			return true;
