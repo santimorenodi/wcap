@@ -156,6 +156,9 @@ Building
 
 To build the binary from source code, have [Visual Studio][VS] installed, and simply run `build.cmd`.
 
+Then run `install.cmd` to copy both exes to `%LOCALAPPDATA%\wcap`, start the tray app with Windows, add a Start menu
+shortcut and set `WCAP_CLI` to the installed `wcap-cli`. Settings `.ini` files live next to the installed exes.
+
 License
 =======
 

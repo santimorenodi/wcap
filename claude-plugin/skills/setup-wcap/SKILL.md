@@ -26,8 +26,16 @@ cmd /c "cd /d C:\path\to\wcap && .\build.cmd"
 - A `"vswhere.exe" no se reconoce` / `is not recognized` line printed by VsDevCmd is harmless.
 - Success = no `error` lines and both exes exist. The build uses `/WX`, so warnings fail it.
 
-Optionally add the repo folder to `PATH` or set `WCAP_CLI` to the full path of `wcap-cli-<arch>.exe`
-so the `record-screen` skill finds it.
+## Install
+
+```bash
+cmd /c "cd /d C:\path\to\wcap && .\install.cmd"
+```
+
+Copies `wcap-<arch>.exe` and `wcap-cli-<arch>.exe` to `%LOCALAPPDATA%\wcap`, registers the tray app to start
+with Windows (`HKCU\...\Run`, value `wcap`), adds a Start menu shortcut and sets the user variable `WCAP_CLI`
+to the installed cli so the `record-screen` skill finds it. If the tray app was running it is closed and started
+again from the install folder. Run it again after every rebuild you want to use day to day.
 
 ## Tray app (wcap.exe)
 

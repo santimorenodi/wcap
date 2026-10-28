@@ -90,6 +90,31 @@ background, do the work, then stop it:
 Never kill the recorder process to stop it: the mp4 is only finalized on a clean stop
 (`-d`, `wcap-cli stop` or Ctrl+C). If a hard kill is possible, record with `--fragmented`.
 
+## When Windows is locked
+
+The user may be following from another device with the PC locked. Check before recording: the
+foreground process is `LockApp.exe` (or `LogonUI.exe` is at the password prompt).
+
+```powershell
+Add-Type 'using System;using System.Runtime.InteropServices;public static class W{[DllImport("user32.dll")]public static extern IntPtr GetForegroundWindow();[DllImport("user32.dll")]public static extern int GetWindowThreadProcessId(IntPtr h,out int p);}'
+$p=0; [W]::GetWindowThreadProcessId([W]::GetForegroundWindow(),[ref]$p) | Out-Null; (Get-Process -Id $p).ProcessName
+```
+
+While locked:
+
+- **Window capture works.** `--window` records the app's own image at full rate (tested at 60 fps,
+  every frame unique, on an Unreal editor under the lock screen). The warning `window is fully
+  covered by other windows` only means the lock screen is on top; ignore it.
+- **Monitor and region capture do not.** `--monitor` / `--region` record the lock screen, usually as a
+  single frame. Use `--window` plus `--crop` to frame part of a window.
+- **Still fatal:** a minimized window (empty or frozen clip) and a window on another virtual desktop
+  (cloaked). `list` skips cloaked windows.
+- **Synthetic input does not reach the app.** `SendInput`, `mouse_event` and `SetCursorPos` go to the
+  lock screen; `SetForegroundWindow` cannot bring the app forward. Do not try to unlock the PC.
+  Drive the app from inside its own process instead (its automation or MCP tools, a scripting
+  console, console commands) while wcap records.
+- A screenshot of the monitor is not a way to look at the app either: use `snapshot --window`.
+
 ## Checking the result
 
 If ffmpeg is available, verify the file and look at a frame instead of assuming it worked:
