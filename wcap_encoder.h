@@ -502,7 +502,14 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 		HR(IMFMediaType_SetUINT64(Type, &MF_MT_FRAME_RATE, MFT64(Config->FramerateNum, Config->FramerateDen)));
 		HR(IMFMediaType_SetUINT64(Type, &MF_MT_FRAME_SIZE, MFT64(OutputWidth, OutputHeight)));
 
-		hr = IMFSinkWriter_SetInputMediaType(Writer, Encoder->VideoStreamIndex, Type, NULL);
+		// enable 2 B-frames, for better compression
+		// must be set before type negotiation, otherwise some encoders (AMD) write mismatched SPS/PPS
+		IMFAttributes* Params;
+		HR(MFCreateAttributes(&Params, 1));
+		HR(IMFAttributes_SetUINT32(Params, &CODECAPI_AVEncMPVDefaultBPictureCount, 2));
+
+		hr = IMFSinkWriter_SetInputMediaType(Writer, Encoder->VideoStreamIndex, Type, Params);
+		IMFAttributes_Release(Params);
 		IMFMediaType_Release(Type);
 
 		if (FAILED(hr))
@@ -532,10 +539,6 @@ BOOL Encoder_Start(Encoder* Encoder, ID3D11Device* Device, LPWSTR FileName, cons
 		// disable low latency, for higher quality & better performance
 		VARIANT LowLatency = { .vt = VT_BOOL, .boolVal = VARIANT_FALSE };
 		ICodecAPI_SetValue(Codec, &CODECAPI_AVLowLatencyMode, &LowLatency);
-
-		// enable 2 B-frames, for better compression
-		VARIANT Bframes = { .vt = VT_UI4, .ulVal = 2 };
-		ICodecAPI_SetValue(Codec, &CODECAPI_AVEncMPVDefaultBPictureCount, &Bframes);
 
 		ICodecAPI_Release(Codec);
 	}
