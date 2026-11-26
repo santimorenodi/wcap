@@ -2,6 +2,7 @@ Changelog
 =========
 
 ##### unreleased
+ * fix corrupted H.264 video with AMD hardware encoder (B-frames set before media type negotiation)
  * wcap-cli: `--fps match` / `--vfr` to skip frames identical to the previous one
  * wcap-cli: `--crop X,Y,W,H` relative to captured window/monitor/region
  * wcap-cli: warnings when captured window is minimized, cloaked or covered
